@@ -1,6 +1,9 @@
 set -x
 
 STRATEGY=${STRATEGY:-fsdp2}
+LABEL="nocol"
+DATETIME=$(date +'%Y%m%d%H%M')
+TAG="${STRATEGY}_${LABEL}_${DATETIME}"
 
 # Colocated GRPO training+generation for Qwen2.5-1.5B-Instruct on GSM8K.
 
@@ -22,7 +25,17 @@ uv run --isolated --extra $INFERENCE_BACKEND -m skyrl_train.entrypoints.main_bas
   data.val_data="['$DATA_DIR/validation.parquet']" \
   trainer.algorithm.advantage_estimator="grpo" \
   trainer.policy.model.path="Qwen/Qwen2.5-1.5B-Instruct" \
-  trainer.placement.colocate_all=true \
+  trainer.placement.colocate_all=false \
+  trainer.placement.colocate_policy_ref=true \
+  trainer.placement.colocate_critic_reward=true \
+  trainer.placement.policy_num_nodes=1 \
+  trainer.placement.policy_num_gpus_per_node=2 \
+  trainer.placement.critic_num_nodes=1 \
+  trainer.placement.critic_num_gpus_per_node=2 \
+  trainer.placement.ref_num_nodes=1 \
+  trainer.placement.ref_num_gpus_per_node=2 \
+  reward_num_nodes=1 \
+  reward_num_gpus_per_node=2 \
   trainer.strategy=${STRATEGY} \
   trainer.placement.policy_num_gpus_per_node=$NUM_GPUS \
   trainer.placement.ref_num_gpus_per_node=$NUM_GPUS \
@@ -52,8 +65,8 @@ uv run --isolated --extra $INFERENCE_BACKEND -m skyrl_train.entrypoints.main_bas
   generator.gpu_memory_utilization=0.8 \
   trainer.logger="$LOGGER" \
   trainer.project_name="gsm8k" \
-  trainer.run_name="gsm8k_test_${STRATEGY}" \
+  trainer.run_name="gsm8k_test_${TAG}_${STRATEGY}" \
   trainer.resume_mode=null \
   trainer.ckpt_path="$HOME/ckpts/gsm8k_1.5B_ckpt" \
   $@ \
-  2>&1 | tee gsm8k_1.5B_grpo_${STRATEGY}.log
+  2>&1 | tee gsm8k_1.5B_grpo_${TAG}.log
