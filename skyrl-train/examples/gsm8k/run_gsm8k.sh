@@ -1,5 +1,7 @@
 set -x
 
+STRATEGY=${STRATEGY:-fsdp2}
+
 # Colocated GRPO training+generation for Qwen2.5-1.5B-Instruct on GSM8K.
 
 # uv run examples/gsm8k/gsm8k_dataset.py --output_dir $HOME/data/gsm8k
@@ -21,12 +23,12 @@ uv run --isolated --extra $INFERENCE_BACKEND -m skyrl_train.entrypoints.main_bas
   trainer.algorithm.advantage_estimator="grpo" \
   trainer.policy.model.path="Qwen/Qwen2.5-1.5B-Instruct" \
   trainer.placement.colocate_all=true \
-  trainer.strategy=fsdp2 \
+  trainer.strategy=${STRATEGY} \
   trainer.placement.policy_num_gpus_per_node=$NUM_GPUS \
   trainer.placement.ref_num_gpus_per_node=$NUM_GPUS \
   generator.num_inference_engines=$NUM_GPUS \
   generator.inference_engine_tensor_parallel_size=1 \
-  trainer.epochs=20 \
+  trainer.epochs=1 \
   trainer.eval_batch_size=1024 \
   trainer.eval_before_train=true \
   trainer.eval_interval=5 \
@@ -53,4 +55,5 @@ uv run --isolated --extra $INFERENCE_BACKEND -m skyrl_train.entrypoints.main_bas
   trainer.run_name="gsm8k_test" \
   trainer.resume_mode=null \
   trainer.ckpt_path="$HOME/ckpts/gsm8k_1.5B_ckpt" \
-  $@
+  $@ \
+  2>&1 | tee gsm8k_1.5B_grpo_${STRATEGY}.log

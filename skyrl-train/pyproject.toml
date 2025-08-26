@@ -39,6 +39,7 @@ dependencies = [
     "skyrl-gym",
     "flash-attn",
     "polars",
+    "deepspeed>=0.16.5",
 ]
 
 [tool.uv]
