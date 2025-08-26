@@ -252,6 +252,9 @@ class BasePPOExp:
 
         inference_engine_client = InferenceEngineClient(inference_engines)
 
+        from skyrl_train.utils import show_placement_group_status
+        show_placement_group_status("AFTER_SETUP_INFERENCE")
+
         generator: GeneratorInterface = self.get_generator(self.cfg, tokenizer, inference_engine_client)
 
         trainer = self.get_trainer(

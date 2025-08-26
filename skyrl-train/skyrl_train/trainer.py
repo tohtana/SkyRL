@@ -29,7 +29,7 @@ from skyrl_train.dataset.preprocess import (
 )
 from skyrl_train.utils import ppo_utils
 from skyrl_train.utils import trainer_utils
-from skyrl_train.utils import Timer, get_ray_pg_ready_with_timeout
+from skyrl_train.utils import Timer, get_ray_pg_ready_with_timeout, show_placement_group_status
 from skyrl_train.utils.ppo_utils import (
     compute_approx_kl,
     masked_mean,
@@ -436,6 +436,8 @@ class RayPPOTrainer:
         cfg = self.cfg
         pg = None
 
+        show_placement_group_status("START_BUILD_MODELS")
+
         if RewardWorker is not None and cfg.trainer.reward.model.path:
             raise NotImplementedError("reward models are not supported yet")
 
@@ -527,6 +529,7 @@ class RayPPOTrainer:
                 ]
                 pg = placement_group(bundles, strategy="PACK")
                 get_ray_pg_ready_with_timeout(pg, timeout=30)
+            show_placement_group_status("AFTER_POLICY_ALLOC")
 
             policy_model = PPORayActorGroup(
                 cfg,
@@ -567,8 +570,11 @@ class RayPPOTrainer:
                     }
                     for _ in range(cfg.trainer.placement.critic_num_nodes)
                 ]
+
                 pg = placement_group(bundles, strategy="PACK")
                 get_ray_pg_ready_with_timeout(pg, timeout=30)
+
+            show_placement_group_status("AFTER_CRITIC_ALLOC")
 
             if cfg.trainer.critic.model.path:
                 critic_model = PPORayActorGroup(

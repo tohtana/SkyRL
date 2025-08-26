@@ -421,6 +421,18 @@ def get_ray_pg_ready_with_timeout(pg: PlacementGroup, timeout: int = 60):
             f"Error: {e}"
         )
 
+def show_placement_group_status(label: str):
+    from ray.util.state import list_placement_groups
+    filters = {("state", "=", "CREATED")}
+    pgs = list_placement_groups(filters=filters, detail=True)
+    logger.warning(f"[{label}] Listing all placement groups #PG={len(pgs)}")
+    for i, pg in enumerate(pgs):
+        logger.warning(f" {i} ID: {pg.placement_group_id} STATE: {pg.state} NAME: {pg.name}")
+        if hasattr(pg, "bundles"):
+            logger.warning(f"    bundles: {pg.bundles}")
+        # if hasattr(pg, "stats"):
+        #     logger.warning(f"    stats: {pg.stats}") 
+
 
 # NOTE (sumanthrh): For SGLang, the string representations here should also match those used by (and supported by) SGLang.
 # This is because we do not control the update weight implementation with SGLang backend.
