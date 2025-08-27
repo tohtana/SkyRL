@@ -558,21 +558,26 @@ class RayPPOTrainer:
             # if colocated, create placement group for critic and reward model explicitly.
             pg = None
             if cfg.trainer.placement.colocate_critic_reward:
-                assert (
-                    cfg.trainer.placement.critic_num_nodes == cfg.trainer.placement.reward_num_nodes
-                    and cfg.trainer.placement.critic_num_gpus_per_node == cfg.trainer.placement.reward_num_gpus_per_node
-                ), "num_nodes and num_gpus_per_node must be the same when colocate critic and reward model."
+                if cfg.trainer.critic.model.path:
+                    assert (
+                        cfg.trainer.placement.critic_num_nodes == cfg.trainer.placement.reward_num_nodes
+                        and cfg.trainer.placement.critic_num_gpus_per_node == cfg.trainer.placement.reward_num_gpus_per_node
+                    ), "num_nodes and num_gpus_per_node must be the same when colocate critic and reward model."
 
-                bundles = [
-                    {
-                        "GPU": cfg.trainer.placement.critic_num_gpus_per_node,
-                        "CPU": cfg.trainer.placement.critic_num_gpus_per_node,
-                    }
-                    for _ in range(cfg.trainer.placement.critic_num_nodes)
-                ]
+                    bundles = [
+                        {
+                            "GPU": cfg.trainer.placement.critic_num_gpus_per_node,
+                            "CPU": cfg.trainer.placement.critic_num_gpus_per_node,
+                        }
+                        for _ in range(cfg.trainer.placement.critic_num_nodes)
+                    ]
 
-                pg = placement_group(bundles, strategy="PACK")
-                get_ray_pg_ready_with_timeout(pg, timeout=30)
+                    pg = placement_group(bundles, strategy="PACK")
+                    get_ray_pg_ready_with_timeout(pg, timeout=30)
+                else:
+                    logger.warning(
+                        "colocate_critic_reward is set to True but no critic model path is specified. Ignoring resource request for critic and reward models."
+                    )
 
             show_placement_group_status("AFTER_CRITIC_ALLOC")
 
