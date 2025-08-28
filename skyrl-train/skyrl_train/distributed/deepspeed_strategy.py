@@ -9,6 +9,7 @@ from datetime import timedelta
 from typing import List, Union, Optional
 from omegaconf import OmegaConf
 from jaxtyping import Float
+from contextlib import contextmanager
 
 import deepspeed
 import numpy as np
@@ -373,6 +374,13 @@ class DeepspeedStrategy(DistributedStrategy):
 
         dist.barrier()
 
+    def _set_autocast_config(self, ds_config):
+        ds_config["torch_autocast"] = {
+            "enabled": self.bf16,
+            "dtype": "bfloat16",
+            "lower_precision_safe_modules": ["torch.nn.Linear", "torch.nn.Conv2d"],
+        }
+
     def get_ds_train_config(self):
         ds_config = OmegaConf.to_container(self.deepspeed_config)
         disable_trace_cache = ds_config.pop("disable_trace_cache", False)
@@ -381,7 +389,7 @@ class DeepspeedStrategy(DistributedStrategy):
             ds_config["zero_optimization"]["stage3_max_live_parameters"] = 0
             ds_config["zero_optimization"]["stage3_max_reuse_distance"] = 0
         ds_config["steps_per_print"] = 100
-        ds_config["bf16"] = {"enabled": self.bf16}
+        self._set_autocast_config(ds_config)
 
         # these need to be specified for deepspeed setup, but we manually handle
         # gradient accumulation in the training loop
@@ -393,8 +401,16 @@ class DeepspeedStrategy(DistributedStrategy):
     def get_ds_eval_config(self):
         ds_config = OmegaConf.to_container(self.deepspeed_config)
         ds_config["steps_per_print"] = 100
-        ds_config["bf16"] = {"enabled": self.bf16}
+        self._set_autocast_config(ds_config)
         ds_config["train_micro_batch_size_per_gpu"] = self.micro_train_batch_size_per_gpu
         ds_config["gradient_accumulation_steps"] = 1
 
         return ds_config
+
+    @contextmanager
+    def autocast(self, *args, **kwargs):
+        """
+        No-op context manager for DeepSpeed.
+        DeepSpeed handles mixed precision internally, so we disable torch.autocast.
+        """
+        yield
