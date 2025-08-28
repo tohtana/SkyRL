@@ -9,6 +9,7 @@ from datetime import timedelta
 from typing import List, Union, Optional
 from omegaconf import OmegaConf
 from jaxtyping import Float
+from contextlib import contextmanager
 
 import deepspeed
 import numpy as np
@@ -75,6 +76,14 @@ class DeepspeedStrategy(DistributedStrategy):
         deepspeed.init_distributed(timeout=timeout)
         self.world_size = dist.get_world_size()
         self.accumulated_gradient = self.train_batch_size // self.micro_train_batch_size_per_gpu // self.world_size
+
+    @contextmanager
+    def autocast(self, *args, **kwargs):
+        """
+        No-op context manager for DeepSpeed.
+        DeepSpeed handles mixed precision internally, so we disable torch.autocast.
+        """
+        yield
 
     def create_optimizer(self, model, offload_after_step=True, **kwargs) -> Optimizer:
         if isinstance(model, Actor):

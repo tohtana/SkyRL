@@ -5,6 +5,12 @@ zero_optimization:
   offload_param:
     device: cpu # set to cpu for offload, else none
     pin_memory: true
+torch_autocast:
+  enabled: true
+  dtype: "bfloat16"
+  lower_precision_safe_modules:
+    - torch.nn.Linear
+    - torch.nn.Conv2d
 gradient_clipping: 1.0
 prescale_gradient: false
 wall_clock_breakdown: false
