@@ -390,7 +390,12 @@ class DeepspeedStrategy(DistributedStrategy):
             ds_config["zero_optimization"]["stage3_max_live_parameters"] = 0
             ds_config["zero_optimization"]["stage3_max_reuse_distance"] = 0
         ds_config["steps_per_print"] = 100
-        ds_config["bf16"] = {"enabled": self.bf16}
+        if self.bf16:
+            ds_config["torch_autocast"] = {
+                "enabled": True,
+                "dtype": "bfloat16",
+                "lower_precision_safe_modules": ["torch.nn.Linear", "torch.nn.Conv2d"],
+            }
 
         # these need to be specified for deepspeed setup, but we manually handle
         # gradient accumulation in the training loop
@@ -402,7 +407,13 @@ class DeepspeedStrategy(DistributedStrategy):
     def get_ds_eval_config(self):
         ds_config = OmegaConf.to_container(self.deepspeed_config)
         ds_config["steps_per_print"] = 100
-        ds_config["bf16"] = {"enabled": self.bf16}
+        if self.bf16:
+            ds_config["torch_autocast"] = {
+                "enabled": True,
+                "dtype": "bfloat16",
+                "lower_precision_safe_modules": ["torch.nn.Linear", "torch.nn.Conv2d"],
+            }
+
         ds_config["train_micro_batch_size_per_gpu"] = self.micro_train_batch_size_per_gpu
         ds_config["gradient_accumulation_steps"] = 1
 
