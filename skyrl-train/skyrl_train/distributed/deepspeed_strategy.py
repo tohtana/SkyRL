@@ -9,7 +9,6 @@ from datetime import timedelta
 from typing import List, Union, Optional
 from omegaconf import OmegaConf
 from jaxtyping import Float
-from contextlib import contextmanager
 
 import deepspeed
 import numpy as np
@@ -405,11 +404,3 @@ class DeepspeedStrategy(DistributedStrategy):
         ds_config["gradient_accumulation_steps"] = 1
 
         return ds_config
-
-    @contextmanager
-    def autocast(self, *args, **kwargs):
-        """
-        No-op context manager for DeepSpeed.
-        DeepSpeed handles mixed precision internally, so we disable torch.autocast.
-        """
-        yield
