@@ -6,12 +6,10 @@ from typing import Any, List, Optional, Dict, Tuple, Union
 from jaxtyping import Float
 from pathlib import Path
 import ray
-import uuid
 import torch
 from loguru import logger
 from omegaconf import DictConfig
 from ray.util.placement_group import PlacementGroup, placement_group
-from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
 from transformers import AutoTokenizer
 
@@ -23,13 +21,14 @@ from skyrl_train.generators.base import (
     GeneratorOutput,
     GeneratorInterface,
 )
-from skyrl_train.generators.utils import concatenate_generator_outputs, get_metrics_from_generator_output
+from skyrl_train.generators.utils import get_metrics_from_generator_output, prepare_generator_input
 from skyrl_train.dataset.preprocess import (
     convert_prompts_responses_to_batch_tensors,
 )
 from skyrl_train.utils import ppo_utils
-from skyrl_train.utils import trainer_utils
+from skyrl_train.utils import trainer_utils, io
 from skyrl_train.utils import Timer, get_ray_pg_ready_with_timeout
+from skyrl_train.utils.constants import SKYRL_RAY_PG_TIMEOUT_IN_S
 from skyrl_train.utils.ppo_utils import (
     compute_approx_kl,
     masked_mean,
@@ -49,13 +48,14 @@ from skyrl_train.utils.trainer_utils import (
     get_node_ids,
     extract_step_from_path,
     validate_consistency_for_latest_checkpoint,
-    calculate_per_dataset_metrics,
-    dump_per_dataset_eval_results,
     validate_generator_output,
     GLOBAL_STEP_PREFIX,
     ResumeMode,
     DynamicSamplingState,
+    build_dataloader,
 )
+from skyrl_train.utils.utils import configure_ray_worker_logging
+from skyrl_train.evaluate import evaluate
 
 
 class RayPPOTrainer:
@@ -64,7 +64,7 @@ class RayPPOTrainer:
         cfg: DictConfig,
         tracker: Tracking,
         tokenizer: AutoTokenizer,
-        train_dataset: PromptDataset,
+        train_dataset: Optional[PromptDataset],
         inference_engine_client: InferenceEngineClient,
         generator: GeneratorInterface,
         colocate_pg: Optional[PlacementGroup] = None,
@@ -77,20 +77,23 @@ class RayPPOTrainer:
         self.eval_dataset = eval_dataset
         self.inference_engine_client = inference_engine_client
         self.generator = generator
-        self.train_dataloader = self.build_dataloader(train_dataset, is_train=True)
-        self.eval_dataloader = self.build_dataloader(eval_dataset, is_train=False) if eval_dataset is not None else None
+        self.train_dataloader = build_dataloader(self.cfg, train_dataset, is_train=True)
+        self.total_training_steps = len(self.train_dataloader) * self.cfg.trainer.epochs
+        self.eval_dataloader = (
+            build_dataloader(self.cfg, eval_dataset, is_train=False) if eval_dataset is not None else None
+        )
         self.colocate_pg = colocate_pg
 
         self.resume_mode = ResumeMode(cfg.trainer.resume_mode)
 
         self.all_metrics = {}
         self.all_timings = {}
+        self.global_step = 0
 
         # initialized in `build_models`
         self.policy_model: PPORayActorGroup = None
         self.critic_model: Optional[PPORayActorGroup] = None
         self.ref_model: Optional[PPORayActorGroup] = None
-        self.reward_model: Optional[PPORayActorGroup] = None
         # used for checkpoint cleanup
         self._node_ids: Optional[List[str]] = None
 
@@ -100,35 +103,7 @@ class RayPPOTrainer:
         self.dynamic_sampling_state: Optional[DynamicSamplingState] = None
 
         self.reward_kl_controller: Optional[Union[FixedKLController, AdaptiveKLController]] = None
-
-    def build_dataloader(self, dataset: PromptDataset, is_train=True):
-        """
-        Build the dataloader for the training or evaluation dataset
-        """
-        # prepare dataloader
-        batch_size = self.cfg.trainer.train_batch_size if is_train else self.cfg.trainer.eval_batch_size
-
-        # Seed the dataloader for reproducibility.
-        seeded_generator = torch.Generator()
-        seeded_generator.manual_seed(self.cfg.trainer.seed)
-
-        dataloader = StatefulDataLoader(
-            dataset,
-            batch_size=batch_size,
-            shuffle=True if is_train else False,
-            collate_fn=dataset.collate_fn,
-            # TODO(Charlie): debug why inference http endpoint is slow when num_workers is 8
-            num_workers=0 if self.cfg.generator.enable_http_endpoint else 8,
-            drop_last=True if is_train else False,
-            generator=seeded_generator,
-        )
-        if is_train:
-            self.total_training_steps = len(dataloader) * self.cfg.trainer.epochs
-            print(f"Total steps: {self.total_training_steps}")
-        else:
-            print(f"Validation set size: {len(dataloader)}")
-
-        return dataloader
+        configure_ray_worker_logging()
 
     @torch.no_grad()
     async def eval(self) -> Dict[str, float]:
@@ -141,69 +116,13 @@ class RayPPOTrainer:
         Returns:
             A dictionary of evaluation metrics.
         """
-        # 0. Make a copy of self.all_metrics (will restore at the end)
-        # eval() might accidentally mutate `self.all_metrics` since it is mutated in
-        # methods like `self.generate()`.
-        all_metrics_copy = self.all_metrics.copy()
-
-        # 1. Get all generator outputs
-        generator_outputs: List[GeneratorOutput] = []
-        concat_all_envs: List[str] = []
-        concat_env_extras: List[Dict[str, Any]] = []
-        concat_uids: List[str] = []
-        sampling_params = self.cfg.generator.eval_sampling_params
-        pbar = tqdm(total=len(self.eval_dataloader), initial=0, desc="Evaluation Progress")
-        for _, prompts in enumerate(self.eval_dataloader):
-            pbar.update(1)
-            generator_input, uids = self._prepare_generator_input(
-                self.cfg.generator.eval_n_samples_per_prompt, prompts, sampling_params
-            )
-            generator_output: GeneratorOutput = await self.generate(generator_input)
-            generator_outputs.append(generator_output)
-            concat_all_envs.extend(generator_input["env_classes"])
-            concat_env_extras.extend(generator_input["env_extras"])
-            concat_uids.extend(uids)
-        concat_generator_outputs: GeneratorOutput = concatenate_generator_outputs(generator_outputs)
-
-        # Extract data_sources from env_extras
-        concat_data_sources = [env_extra.get("data_source") for env_extra in concat_env_extras]
-        vis = self.tokenizer.decode(generator_output["response_ids"][0])
-        print("Eval output example: ", vis)
-
-        # 2. Group data by data source and calculate per-dataset metrics
-        eval_metrics = calculate_per_dataset_metrics(
-            concat_generator_outputs, concat_uids, concat_data_sources, self.cfg.generator.eval_n_samples_per_prompt
+        eval_metrics = await evaluate(
+            eval_dataloader=self.eval_dataloader,
+            generator=self.generator,
+            cfg=self.cfg,
+            global_step=self.global_step,
+            tokenizer=self.tokenizer,
         )
-
-        # 3. Calculate overall metrics across all datasets
-        overall_avg_score, overall_pass_at_n = get_metrics_from_generator_output(concat_generator_outputs, concat_uids)
-        eval_metrics.update(
-            {
-                "eval/all/avg_score": overall_avg_score,
-                f"eval/all/pass_at_{self.cfg.generator.eval_n_samples_per_prompt}": overall_pass_at_n,
-            }
-        )
-
-        # 4. Prepare dumping data
-        if self.cfg.trainer.dump_eval_results:
-            with Timer("dump_eval_results"):
-                data_save_dir = (
-                    Path(self.cfg.trainer.export_path) / "dumped_evals" / f"global_step_{self.global_step}_evals"
-                )
-                data_save_dir.mkdir(parents=True, exist_ok=True)
-                dump_per_dataset_eval_results(
-                    data_save_dir,
-                    self.tokenizer,
-                    concat_generator_outputs,
-                    concat_data_sources,
-                    concat_all_envs,
-                    concat_env_extras,
-                    eval_metrics,
-                )
-
-        # 5. Restore self.all_metrics
-        self.all_metrics = all_metrics_copy
-
         return eval_metrics
 
     def train(self):
@@ -211,44 +130,40 @@ class RayPPOTrainer:
         Main training loop for PPO
         """
 
-        self.global_step = 0
         self.weights_manager = InferenceWeightsManager(
-            self.policy_model, self.inference_engine_client, self.cfg.trainer.placement.colocate_all
+            self.policy_model,
+            self.inference_engine_client,
+            self.cfg.trainer.placement.colocate_all,
+            sleep_on_exit=True,
         )
-        # NOTE(Charlie): sglang's engine needs to sync weights after wake up. see https://github.com/sgl-project/sglang/issues/7939
-        # Change it to True after sglang fixes the issue.
-        sync_before_eval = self.cfg.trainer.placement.colocate_all and self.cfg.generator.backend == "sglang"
         self.eval_weights_manager = InferenceWeightsManager(
             self.policy_model,
             self.inference_engine_client,
             self.cfg.trainer.placement.colocate_all,
-            no_sync=not sync_before_eval,
+            sleep_on_exit=False,
         )
 
-        # Load checkpoint state if resumption is enabled
+        # Initialize weight sync state between policy model and inference engines.
+        with Timer("init_weight_sync_state"):
+            self.init_weight_sync_state()
+
+        # Load policy model to GPU before loading checkpoint.
+        if self.cfg.trainer.placement.colocate_all:
+            self.policy_model.backload_to_gpu()
+
+        # Load checkpoint state if resumption is enabled.
         if self.resume_mode != ResumeMode.NONE:
             with Timer("load_checkpoints"):
-                self.load_checkpoints()
-                logger.info(f"Resumed training from global_step {self.global_step}")
-
-        # create rank0 policy model and inference_engines groups, then broadcast weights to inference_engines
-        with Timer("setup_policy_and_generator"):
-            self.setup_policy_and_generator()
-            if self.cfg.trainer.placement.colocate_all:
-                self.policy_model.backload_to_gpu()
+                self.global_step = self.load_checkpoints()
 
         # Eval before training
+        inference_engine_is_active = False
         if self.cfg.trainer.eval_interval > 0 and self.cfg.trainer.eval_before_train:
             with self.eval_weights_manager:
                 with Timer("eval", self.all_timings):
                     eval_metrics = asyncio.run(self.eval())
-                    self.tracker.log(eval_metrics, step=self.global_step)
-            # Policy model is backloaded to GPU after eval
-            if self.cfg.trainer.placement.colocate_all:
-                self.policy_model.backload_to_gpu()
-
-        # setup for dynamic sampling
-        keep_sampling = False
+                    self.tracker.log(eval_metrics, step=self.global_step, commit=True)
+            inference_engine_is_active = True
 
         # initialize kl controller
         if self.cfg.trainer.algorithm.use_kl_in_reward:
@@ -263,15 +178,23 @@ class RayPPOTrainer:
 
                     # 0. truncate data to have even shards
                     rand_prompts = self._remove_tail_data(rand_prompts)
-                    generator_input, uids = self._prepare_generator_input(
-                        self.cfg.generator.n_samples_per_prompt, rand_prompts, self.cfg.generator.sampling_params
+                    generator_input, uids = prepare_generator_input(
+                        rand_prompts,
+                        self.cfg.generator.n_samples_per_prompt,
+                        get_sampling_params_for_backend(self.cfg.generator.backend, self.cfg.generator.sampling_params),
+                        self.cfg.environment.env_class,
+                        "train",
+                        self.global_step,
                     )
 
-                    # if we are continuing sampling, we don't want to trigger weight management
-                    weights_manager = ConditionalWeightsManager(self.weights_manager, not keep_sampling)
+                    # if the inference engine is already active due to continuing sampling or eval, we don't want to trigger weight management
+                    weights_manager = ConditionalWeightsManager(
+                        self.weights_manager, condition=not inference_engine_is_active
+                    )
 
-                    # NOTE: Policy model is on GPU at the beginning of each training step
-                    # After exiting the context manager, policy model is on CPU with `colocate_all` enabled.
+                    # NOTE: Policy model is on GPU at the beginning of each training step, unless eval was run prior to the step
+                    # in which case the inference engine is active and the policy model is on CPU.
+                    # After exiting the context manager, the policy model is on CPU with `colocate_all` enabled
                     # Policy model stays on cpu because the training loop will carefully backload different models depending on colocation strategy
                     with weights_manager:
                         # 1.1 generation phase
@@ -282,11 +205,16 @@ class RayPPOTrainer:
                         if self.cfg.trainer.algorithm.dynamic_sampling.type is not None:
                             generator_output, uids, keep_sampling = self.handle_dynamic_sampling(generator_output, uids)
                             # update weights manager condition to ensure we trigger sleep only when we are not continuing sampling
-                            weights_manager.update_condition(not keep_sampling)
+                            weights_manager.update_condition(condition=not keep_sampling)
+                            inference_engine_is_active = keep_sampling
                             if keep_sampling:  # continue sampling
                                 # update progress bar for current batch (but not global step)
                                 pbar.update(1)
                                 continue
+
+                        # if we are not continuing sampling, we trigger sleep and mark inference engine as inactive
+                        weights_manager.update_condition(True)
+                        inference_engine_is_active = False
 
                     # 1.2 postprocess rewards
                     with Timer("postprocess_generator_output", self.all_timings):
@@ -294,7 +222,7 @@ class RayPPOTrainer:
 
                     # 2. print example just for debugging
                     vis = self.tokenizer.decode(generator_output["response_ids"][0])
-                    print("example: ", vis)
+                    logger.info(f"Example:\n" f"  Input: {generator_input['prompts'][0]}\n" f"  Output:\n{vis}")
 
                     with Timer("convert_to_training_input", self.all_timings):
                         training_input: TrainingInputBatch = self.convert_to_training_input(generator_output, uids)
@@ -313,7 +241,7 @@ class RayPPOTrainer:
                     with Timer("compute_advantages_and_returns", self.all_timings):
                         training_input = self.compute_advantages_and_returns(training_input)
                         # remove some unwanted keys
-                        for key in ["custom_rewards", "rm_rewards"]:
+                        for key in ["rewards"]:
                             training_input.pop(key)
                         training_input.metadata.pop("uids")
 
@@ -330,7 +258,15 @@ class RayPPOTrainer:
                     with Timer("train_critic_and_policy", self.all_timings):
                         status = self.train_critic_and_policy(training_input)
 
-                # 5. set logs
+                # 5. conditionally save checkpoints and hf model
+                if self.cfg.trainer.ckpt_interval > 0 and self.global_step % self.cfg.trainer.ckpt_interval == 0:
+                    with Timer("save_checkpoints", self.all_timings):
+                        self.save_checkpoints()
+                if self.cfg.trainer.hf_save_interval > 0 and self.global_step % self.cfg.trainer.hf_save_interval == 0:
+                    with Timer("save_hf_model", self.all_timings):
+                        self.save_models()
+
+                # 6. set logs
                 logger.info(status)
                 # log epoch info
                 self.all_metrics.update({"trainer/epoch": epoch, "trainer/global_step": self.global_step})
@@ -342,21 +278,14 @@ class RayPPOTrainer:
                         with Timer("eval", self.all_timings):
                             eval_metrics = asyncio.run(self.eval())
                             self.all_metrics.update(eval_metrics)
-                    # Policy model is backloaded to GPU after eval
-                    if self.cfg.trainer.placement.colocate_all:
-                        self.policy_model.backload_to_gpu()
+                    inference_engine_is_active = True
 
-                self.tracker.log(self.all_metrics, step=self.global_step)
+                log_payload = {
+                    **self.all_metrics,
+                    **{f"timing/{k}": v for k, v in self.all_timings.items()},
+                }
+                self.tracker.log(log_payload, step=self.global_step, commit=True)
                 self.all_metrics = {}
-
-                if self.cfg.trainer.ckpt_interval > 0 and self.global_step % self.cfg.trainer.ckpt_interval == 0:
-                    with Timer("save_checkpoints", self.all_timings):
-                        self.save_checkpoints()
-                if self.cfg.trainer.hf_save_interval > 0 and self.global_step % self.cfg.trainer.hf_save_interval == 0:
-                    with Timer("save_hf_model", self.all_timings):
-                        self.save_models()
-
-                self.tracker.log({"timing/" + k: v for k, v in self.all_timings.items()}, step=self.global_step)
                 self.all_timings = {}
 
                 # update progress bar after logging
@@ -366,6 +295,11 @@ class RayPPOTrainer:
 
                 del training_input, generator_output
 
+            # Ensure that the policy model is on GPU at the end of every epoch
+            if inference_engine_is_active and self.cfg.trainer.placement.colocate_all:
+                asyncio.run(self.inference_engine_client.sleep())
+                self.policy_model.backload_to_gpu()
+                inference_engine_is_active = False
             if self.cfg.trainer.update_ref_every_epoch and self.ref_model is not None:
                 with Timer("update_ref_with_policy", self.all_timings):
                     self.update_ref_with_policy()
@@ -388,53 +322,14 @@ class RayPPOTrainer:
             dp_size = math.lcm(dp_size, self.critic_model.actor_infos[0].rank.dp_size)
         if self.ref_model is not None:
             dp_size = math.lcm(dp_size, self.ref_model.actor_infos[0].rank.dp_size)
-        if self.reward_model is not None:
-            dp_size = math.lcm(dp_size, self.reward_model.actor_infos[0].rank.dp_size)
         return entries[: (len(entries) // dp_size) * dp_size]
 
-    def _prepare_generator_input(
-        self, n_samples_per_prompt: int, rand_prompts: List[Any], sampling_params: Dict[str, Any]
-    ) -> Tuple[GeneratorInput, List[str]]:
-        """
-        Replicate prompts if needed and generate uids.
-        """
-        all_prompts = sum([[prompt["prompt"]] * n_samples_per_prompt for prompt in rand_prompts], [])
-
-        all_envs = sum(
-            [
-                [prompt["env_class"] if prompt["env_class"] is not None else self.cfg.environment.env_class]
-                * self.cfg.generator.n_samples_per_prompt
-                for prompt in rand_prompts
-            ],
-            [],
-        )
-
-        # all the other columns are env_extras
-        env_extras = sum(
-            [[prompt["env_extras"]] * n_samples_per_prompt for prompt in rand_prompts],
-            [],
-        )
-        request_sampling_params = get_sampling_params_for_backend(self.cfg.generator.backend, sampling_params)
-        generator_input: GeneratorInput = {
-            "prompts": all_prompts,
-            "env_classes": all_envs,
-            "env_extras": env_extras,
-            "sampling_params": request_sampling_params,
-        }
-
-        # uids for each sample - NOTE: we assume that generate returns samples in the same order as passed in
-        uids = sum([[str(uuid.uuid4())] * n_samples_per_prompt for _ in rand_prompts], [])
-        return generator_input, uids
-
-    def build_models(self, PolicyWorker, CriticWorker, RefWorker, RewardWorker=None):
+    def build_models(self, PolicyWorker, CriticWorker, RefWorker):
         """
         Initialize the actors for training, and handle colocation logic
         """
         cfg = self.cfg
         pg = None
-
-        if RewardWorker is not None and cfg.trainer.reward.model.path:
-            raise NotImplementedError("reward models are not supported yet")
 
         use_ref_model = cfg.trainer.algorithm.use_kl_loss or cfg.trainer.algorithm.use_kl_in_reward
 
@@ -442,7 +337,11 @@ class RayPPOTrainer:
             num_policy_gpus = cfg.trainer.placement.policy_num_gpus_per_node * cfg.trainer.placement.policy_num_nodes
             num_critic_gpus = cfg.trainer.placement.critic_num_gpus_per_node * cfg.trainer.placement.critic_num_nodes
             num_ref_gpus = cfg.trainer.placement.ref_num_gpus_per_node * cfg.trainer.placement.ref_num_nodes
-            num_rollout_gpus = cfg.generator.num_inference_engines * cfg.generator.inference_engine_tensor_parallel_size
+            num_rollout_gpus = (
+                cfg.generator.num_inference_engines
+                * cfg.generator.inference_engine_tensor_parallel_size
+                * cfg.generator.inference_engine_data_parallel_size
+            )
             assert (
                 num_policy_gpus == num_rollout_gpus
             ), "num_policy_gpus and num_rollout_gpus must be the same when colocating all models"
@@ -493,21 +392,6 @@ class RayPPOTrainer:
             else:
                 critic_model = None
 
-            # reward model
-            if RewardWorker is not None and cfg.trainer.reward.model.path:
-                reward_model = PPORayActorGroup(
-                    cfg,
-                    cfg.trainer.placement.reward_num_nodes,
-                    cfg.trainer.placement.reward_num_gpus_per_node,
-                    RewardWorker,
-                    pg=pg,
-                    num_gpus_per_actor=0.2,
-                    colocate_all=True,
-                    sequence_parallel_size=cfg.trainer.reward.sequence_parallel_size,
-                )
-            else:
-                reward_model = None
-
         else:
             if cfg.trainer.placement.colocate_policy_ref and use_ref_model:
                 assert (
@@ -523,7 +407,7 @@ class RayPPOTrainer:
                     for _ in range(cfg.trainer.placement.policy_num_nodes)
                 ]
                 pg = placement_group(bundles, strategy="PACK")
-                get_ray_pg_ready_with_timeout(pg, timeout=30)
+                get_ray_pg_ready_with_timeout(pg, timeout=SKYRL_RAY_PG_TIMEOUT_IN_S)
 
             policy_model = PPORayActorGroup(
                 cfg,
@@ -549,52 +433,18 @@ class RayPPOTrainer:
             else:
                 ref_model = None
 
-            # if colocated, create placement group for critic and reward model explicitly.
-            pg = None
-            if cfg.trainer.placement.colocate_critic_reward:
-                assert (
-                    cfg.trainer.placement.critic_num_nodes == cfg.trainer.placement.reward_num_nodes
-                    and cfg.trainer.placement.critic_num_gpus_per_node == cfg.trainer.placement.reward_num_gpus_per_node
-                ), "num_nodes and num_gpus_per_node must be the same when colocate critic and reward model."
-
-                bundles = [
-                    {
-                        "GPU": cfg.trainer.placement.critic_num_gpus_per_node,
-                        "CPU": cfg.trainer.placement.critic_num_gpus_per_node,
-                    }
-                    for _ in range(cfg.trainer.placement.critic_num_nodes)
-                ]
-                pg = placement_group(bundles, strategy="PACK")
-                get_ray_pg_ready_with_timeout(pg, timeout=30)
-
             if cfg.trainer.critic.model.path:
                 critic_model = PPORayActorGroup(
                     cfg,
                     cfg.trainer.placement.critic_num_nodes,
                     cfg.trainer.placement.critic_num_gpus_per_node,
                     CriticWorker,
-                    pg=pg,
-                    num_gpus_per_actor=0.75 if pg else 1,
+                    num_gpus_per_actor=1,
                     colocate_all=False,
                     sequence_parallel_size=cfg.trainer.critic.sequence_parallel_size,
                 )
             else:
                 critic_model = None
-
-            # reward model
-            if RewardWorker is not None and cfg.trainer.reward.model.path:
-                reward_model = PPORayActorGroup(
-                    cfg,
-                    cfg.trainer.placement.reward_num_nodes,
-                    cfg.trainer.placement.reward_num_gpus_per_node,
-                    RewardWorker,
-                    pg=pg,
-                    num_gpus_per_actor=0.25 if pg else 1,
-                    colocate_all=False,
-                    sequence_parallel_size=cfg.trainer.reward.sequence_parallel_size,
-                )
-            else:
-                reward_model = None
 
         if not cfg.trainer.placement.colocate_all:
             refs = []
@@ -613,8 +463,6 @@ class RayPPOTrainer:
                         num_training_steps=self.total_training_steps,
                     )
                 )
-            if cfg.trainer.reward.model.path:
-                refs.extend(reward_model.async_init_model(cfg.trainer.reward.model.path))
             ray.get(refs)
             ray.get(policy_model.async_run_ray_method("pass_through", "_set_pad_token_id", self.tokenizer.pad_token_id))
         else:
@@ -637,18 +485,14 @@ class RayPPOTrainer:
                     )
                 )
                 critic_model.offload_to_cpu()
-            if cfg.trainer.reward.model.path:
-                ray.get(reward_model.async_init_model(cfg.trainer.reward.model.path))
-                reward_model.offload_to_cpu()
 
         self.policy_model: PPORayActorGroup = policy_model
         self.critic_model: Optional[PPORayActorGroup] = critic_model
         self.ref_model: Optional[PPORayActorGroup] = ref_model
-        self.reward_model: Optional[PPORayActorGroup] = reward_model
 
-        logger.info("init policy/ref/critic/reward models done")
+        logger.info("init policy/ref/critic models done")
 
-    def setup_policy_and_generator(self):
+    def init_weight_sync_state(self):
         """
         Setup the connection between policy model and inference engine for weight syncing.
         """
@@ -663,7 +507,7 @@ class RayPPOTrainer:
         """Converts lists to a padded batch of tensors for training"""
         prompt_ids: List[List[int]] = generator_output["prompt_token_ids"]
         response_ids: List[List[int]] = generator_output["response_ids"]
-        custom_rewards: List[List[float]] = generator_output["rewards"]
+        rewards: List[List[float]] = generator_output["rewards"]
         loss_masks: List[List[int]] = generator_output["loss_masks"]
 
         logprobs: Optional[List[List[float]]] = generator_output.get("rollout_logprobs", None)
@@ -672,14 +516,14 @@ class RayPPOTrainer:
             sequences_tensor,
             attention_masks_tensor,
             response_masks_tensor,
-            custom_rewards_tensor,
+            rewards_tensor,
             loss_masks_tensor,
             rollout_logprobs_tensor,
         ) = convert_prompts_responses_to_batch_tensors(
             self.tokenizer,
             prompt_ids,
             response_ids,
-            custom_rewards,
+            rewards,
             loss_masks,
             logprobs,
         )
@@ -694,7 +538,7 @@ class RayPPOTrainer:
                 "sequences": sequences_tensor,  # Full trajectories (padded and concatenated prompts and responses)
                 "attention_mask": attention_masks_tensor,
                 "response_mask": response_masks_tensor,
-                "custom_rewards": custom_rewards_tensor,
+                "rewards": rewards_tensor,
                 "loss_mask": loss_masks_tensor,
                 "rollout_logprobs": rollout_logprobs_tensor,
             },
@@ -722,6 +566,7 @@ class RayPPOTrainer:
             be awake (i.e. on GPU).
         - after calling this method, the same model placement still holds.
         """
+        # NOTE: we assume that .generate returns samples in the same order as passed in
         generator_output: GeneratorOutput = await self.generator.generate(input_batch)
 
         # add rollout metrics to self.all_metrics
@@ -781,16 +626,14 @@ class RayPPOTrainer:
             - `["response_mask"]`: Integer[torch.Tensor, "batch_size seqlen"]
             - `["loss_mask"]`: Integer[torch.Tensor, "batch_size seqlen"]
             - `["values"]`: Float[torch.Tensor, "batch_size"]
-            - `["rm_rewards"]`: Float[torch.Tensor, "batch_size"]
-            - `["custom_rewards"]`: Float[torch.Tensor, "batch_size seqlen"]
+            - `["rewards"]`: Float[torch.Tensor, "batch_size seqlen"]
             - `.metadata["uids"]`: List[str]
 
         Adds:
             - `["advantages"]`: Float[torch.Tensor, "batch_size seqlen"]
             - `["returns"]`: Float[torch.Tensor, "batch_size seqlen"]
         """
-        # TODO (erictang000): we are just supporting custom rewards for now
-        token_level_rewards = data["custom_rewards"]
+        token_level_rewards = data["rewards"]
 
         advantages, returns = ppo_utils.compute_advantages_and_returns(
             token_level_rewards=token_level_rewards,
@@ -863,7 +706,6 @@ class RayPPOTrainer:
             - `["base_action_log_probs"]`: Float[torch.Tensor, "batch_size seqlen"]
             - `["action_log_probs"]`: Float[torch.Tensor, "batch_size seqlen"]
             - `["values"]`: Float[torch.Tensor, "batch_size"]
-            - `["rm_rewards"]`: Float[torch.Tensor, "batch_size"]
         """
         data_fwd_pass = training_input.select(keys=["sequences", "attention_mask"], metadata_keys=["response_length"])
 
@@ -893,16 +735,6 @@ class RayPPOTrainer:
 
             base_action_log_probs_refs = self.ref_model.async_run_ray_method("mesh", "forward", data=data_fwd_pass)
 
-        # handle colocate critic and reward model
-        if (
-            self.cfg.trainer.placement.colocate_critic_reward
-            and not self.cfg.trainer.placement.colocate_all
-            and self.critic_model is not None
-        ):
-            all_rank_values = ray.get(value_refs)
-            values = collect_results(self.critic_model.actor_infos, all_rank_values, key="output")
-            ray.get(self.critic_model.async_run_ray_method("pass_through", "empty_cache"))
-
         if self.ref_model is not None:
             # handle colocate policy and ref model
             if self.cfg.trainer.placement.colocate_policy_ref or self.cfg.trainer.placement.colocate_all:
@@ -912,15 +744,6 @@ class RayPPOTrainer:
                 ray.get(self.ref_model.async_run_ray_method("pass_through", "empty_cache"))
         else:
             base_log_probs = None
-
-        # calculate rewards
-        rewards = None
-        if self.cfg.trainer.use_orm_score and self.reward_model:
-            reward_refs = self.reward_model.async_run_ray_method("mesh", "forward")
-
-            if self.cfg.trainer.placement.colocate_all:
-                all_rank_rewards = ray.get(reward_refs)
-                rewards = collect_results(self.reward_model.actor_infos, all_rank_rewards, key="output")
 
         # calculate action log probs
         if self.cfg.trainer.placement.colocate_all:
@@ -934,11 +757,10 @@ class RayPPOTrainer:
 
         # wait all models done
         # if not colocate_policy_ref, then need to gather base_log_probs
-        # if not colocate_critic_reward and self.critic_model is not None, then need to gather value
-        # reward_refs is always handled at last
+        # if self.critic_model is not None, then need to gather value
         if not self.cfg.trainer.placement.colocate_all:
             if not self.cfg.trainer.placement.colocate_policy_ref:
-                if not self.cfg.trainer.placement.colocate_critic_reward and self.critic_model is not None:
+                if self.critic_model is not None:
                     all_rank_values = ray.get(value_refs)
                     values = collect_results(self.critic_model.actor_infos, all_rank_values, key="output")
 
@@ -948,16 +770,12 @@ class RayPPOTrainer:
                 else:
                     base_log_probs = None
 
-            elif not self.cfg.trainer.placement.colocate_critic_reward and self.critic_model is not None:
+            elif self.critic_model is not None:
                 all_rank_values = ray.get(value_refs)
                 values = collect_results(self.critic_model.actor_infos, all_rank_values, key="output")
 
             all_rank_action_log_probs: List[TrainingOutputBatch] = ray.get(action_log_probs_refs)
             action_log_probs = collect_results(self.policy_model.actor_infos, all_rank_action_log_probs, key="output")
-
-            if self.cfg.trainer.use_orm_score and self.reward_model:
-                all_rank_rewards: List[TrainingOutputBatch] = ray.get(reward_refs)
-                rewards = collect_results(self.reward_model.actor_infos, all_rank_rewards, key="output")
 
         if not self.cfg.trainer.placement.colocate_all:
             empty_cache_refs = self.policy_model.async_run_ray_method("pass_through", "empty_cache")
@@ -965,13 +783,10 @@ class RayPPOTrainer:
                 empty_cache_refs.extend(self.ref_model.async_run_ray_method("pass_through", "empty_cache"))
             if self.critic_model is not None:
                 empty_cache_refs.extend(self.critic_model.async_run_ray_method("pass_through", "empty_cache"))
-            if self.reward_model is not None:
-                empty_cache_refs.extend(self.reward_model.async_run_ray_method("pass_through", "empty_cache"))
             ray.get(empty_cache_refs)
 
         sequences_all: torch.Tensor = training_input["sequences"]
         # NOTE (sumanthrh): The slicing is needed to make sure that the batch dimension doesn't change for the tensordict.
-        rewards = rewards[: len(sequences_all)] if rewards is not None else None
         base_log_probs = base_log_probs[: len(sequences_all)] if base_log_probs is not None else None
         action_log_probs = action_log_probs[: len(sequences_all)]
         values = values[: len(sequences_all)] if values is not None else None
@@ -979,12 +794,15 @@ class RayPPOTrainer:
         training_input["base_action_log_probs"] = base_log_probs
         training_input["action_log_probs"] = action_log_probs
         training_input["values"] = values
-        # rewards from the reward model
-        training_input["rm_rewards"] = rewards  # `None` or torch.Tensor
 
         if self.cfg.generator.sampling_params.logprobs is not None:
             # calculates the difference in probs between inference and trainer components
-            prob_diff = (training_input["rollout_logprobs"].exp() - action_log_probs.exp()).abs()
+            # only consider response tokens
+            logprobs_diff = (
+                training_input["rollout_logprobs"][training_input["loss_mask"] > 0]
+                - action_log_probs[training_input["loss_mask"] > 0]
+            )
+            prob_diff = logprobs_diff.exp().abs()
             prob_diff_mean = prob_diff.mean().item()
             prob_diff_std = prob_diff.std().item()
             self.all_metrics.update(
@@ -1001,7 +819,7 @@ class RayPPOTrainer:
     ) -> TrainingInputBatch:
         """Applies a penalty for KL divergence between the policy log probs and the base model log probs to the rewards."""
         loss_masks_all: torch.Tensor = data["loss_mask"]
-        custom_rewards: torch.Tensor = data["custom_rewards"]
+        rewards: torch.Tensor = data["rewards"]
         base_action_log_probs: torch.Tensor = data["base_action_log_probs"]
         action_log_probs: torch.Tensor = data["action_log_probs"]
 
@@ -1021,8 +839,8 @@ class RayPPOTrainer:
             if self.reward_kl_controller is not None
             else self.cfg.trainer.algorithm.kl_loss_coef
         )
-        custom_rewards = custom_rewards - kl * max(0, kl_loss_coef)
-        data["custom_rewards"] = custom_rewards
+        rewards = rewards - kl * max(0, kl_loss_coef)
+        data["rewards"] = rewards
 
         avg_kl: float = kl_mean.mean().item()
         avg_kl_max: float = kl_max.mean().item()
@@ -1155,8 +973,6 @@ class RayPPOTrainer:
 
     def _get_dp_group_models(self, rank: int, model_type: str = ""):
         model = getattr(self, model_type)
-        if model_type == "reward_model":
-            model = model[0]
         return model._actor_handlers[rank]
 
     def _get_mesh_rank(self, rank: int, model_type: str = "") -> MeshRank:
@@ -1172,16 +988,14 @@ class RayPPOTrainer:
         global_step_folder = os.path.join(self.cfg.trainer.ckpt_path, f"global_step_{self.global_step}")
         policy_save_dir = os.path.join(global_step_folder, "policy")
         critic_save_dir = os.path.join(global_step_folder, "critic")
-        # TODO(tgriggs): Add reward model checkpointing.
 
-        os.makedirs(global_step_folder, exist_ok=True)
+        io.makedirs(global_step_folder, exist_ok=True)
 
         # Save policy checkpoint
         ray.get(
             self.policy_model.async_run_ray_method(
                 "pass_through",
-                "save_ckpt",
-                global_step=self.global_step,
+                "save_checkpoint",
                 ckpt_dir=policy_save_dir,
                 tokenizer=self.tokenizer,
             )
@@ -1196,8 +1010,7 @@ class RayPPOTrainer:
             ray.get(
                 self.critic_model.async_run_ray_method(
                     "pass_through",
-                    "save_ckpt",
-                    global_step=self.global_step,
+                    "save_checkpoint",
                     ckpt_dir=critic_save_dir,
                     tokenizer=self.tokenizer,
                 )
@@ -1211,7 +1024,8 @@ class RayPPOTrainer:
         dataloader_save_path = os.path.join(global_step_folder, "data.pt")
         try:
             dataloader_state_dict = self.train_dataloader.state_dict()
-            torch.save(dataloader_state_dict, dataloader_save_path)
+            with io.open_file(dataloader_save_path, "wb") as f:
+                torch.save(dataloader_state_dict, f)
             logger.info(f"Saved dataloader state to {dataloader_save_path}")
         except Exception as e:
             logger.warning(f"Failed to save dataloader state: {e}")
@@ -1222,12 +1036,13 @@ class RayPPOTrainer:
             "config": self.cfg,
         }
         trainer_state_path = os.path.join(global_step_folder, "trainer_state.pt")
-        torch.save(trainer_state, trainer_state_path)
+        with io.open_file(trainer_state_path, "wb") as f:
+            torch.save(trainer_state, f)
         logger.info(f"Saved trainer state to {trainer_state_path}")
 
         # Atomic tracking - write this last after all saves succeed
         latest_checkpoint_file = os.path.join(self.cfg.trainer.ckpt_path, "latest_ckpt_global_step.txt")
-        with open(latest_checkpoint_file, "w") as f:
+        with io.open_file(latest_checkpoint_file, "w") as f:
             f.write(str(self.global_step))
 
         logger.info(f"Successfully saved checkpoint for global_step_{self.global_step} to: {global_step_folder}")
@@ -1244,11 +1059,10 @@ class RayPPOTrainer:
             cleanup_old_checkpoints,
             self.cfg.trainer.ckpt_path,
             self.cfg.trainer.max_ckpts_to_keep,
-            self.global_step,
         )
         # run on driver as well
         # NOTE (sumanthrh): the function will get called twice on the node with driver process, but it's ok because it's idempotent
-        cleanup_old_checkpoints(self.cfg.trainer.ckpt_path, self.cfg.trainer.max_ckpts_to_keep, self.global_step)
+        cleanup_old_checkpoints(self.cfg.trainer.ckpt_path, self.cfg.trainer.max_ckpts_to_keep)
 
     def load_checkpoints(self) -> int:
         """
@@ -1262,13 +1076,13 @@ class RayPPOTrainer:
             return 0
         # first, let's get resume_path
         elif self.resume_mode == ResumeMode.LATEST:
-            latest_checkpoint_file = Path(self.cfg.trainer.ckpt_path) / "latest_ckpt_global_step.txt"
-            if not latest_checkpoint_file.exists():
+            latest_checkpoint_file = os.path.join(self.cfg.trainer.ckpt_path, "latest_ckpt_global_step.txt")
+            if not io.exists(latest_checkpoint_file):
                 logger.info("No checkpoint found, starting training from scratch")
                 return 0
-            with open(latest_checkpoint_file, "r") as f:
-                ckpt_iteration = int(f.read())
-            checkpoint_path = Path(self.cfg.trainer.ckpt_path) / f"{GLOBAL_STEP_PREFIX}{ckpt_iteration}"
+            with io.open_file(latest_checkpoint_file, "r") as f:
+                ckpt_iteration = int(f.read().strip())
+            checkpoint_path = os.path.join(self.cfg.trainer.ckpt_path, f"{GLOBAL_STEP_PREFIX}{ckpt_iteration}")
             # Run validation: Make sure ckpt folder is consistent with latest_ckpt_global_step.txt
             validate_consistency_for_latest_checkpoint(
                 self.cfg.trainer.ckpt_path,
@@ -1290,42 +1104,40 @@ class RayPPOTrainer:
                 )
 
         # Validate that the path exists
-        if not checkpoint_path.exists():
+        if not io.exists(str(checkpoint_path)):
             raise FileNotFoundError(f"Checkpoint path not found: {checkpoint_path}")
 
         logger.info(f"Loading checkpoint from: {checkpoint_path}")
 
-        # Make path absolute if it's relative
-        checkpoint_path = checkpoint_path.resolve()
-
         # Extract global step from checkpoint path
-        global_step = extract_step_from_path(checkpoint_path)
+        global_step = extract_step_from_path(Path(checkpoint_path))
         if global_step == -1:
             raise ValueError(f"Checkpoint path {checkpoint_path} is not a valid checkpoint path")
-        self.global_step = global_step
         logger.info(f"Resuming from global_step: {global_step}")
 
         # Define paths for different checkpoint components
-        policy_ckpt_dir = checkpoint_path / "policy"
-        critic_ckpt_dir = checkpoint_path / "critic"
-        trainer_state_path = checkpoint_path / "trainer_state.pt"
-        dataloader_state_path = checkpoint_path / "data.pt"
+        policy_ckpt_dir = os.path.join(checkpoint_path, "policy")
+        critic_ckpt_dir = os.path.join(checkpoint_path, "critic")
+        trainer_state_path = os.path.join(checkpoint_path, "trainer_state.pt")
+        dataloader_state_path = os.path.join(checkpoint_path, "data.pt")
 
         # Validate that required checkpoint files exist
-        if not trainer_state_path.exists():
+        if not io.exists(trainer_state_path):
             raise FileNotFoundError(f"Trainer state file not found: {trainer_state_path}")
 
         # 1. Load and validate trainer state
-        trainer_state = torch.load(trainer_state_path, map_location="cpu", weights_only=False)
+        with io.open_file(trainer_state_path, "rb") as f:
+            trainer_state = torch.load(f, map_location="cpu", weights_only=False)
         saved_global_step = trainer_state.get("global_step", global_step)
         logger.info("Successfully loaded trainer state")
         if saved_global_step != global_step:
             logger.warning(f"Global step mismatch: path={global_step}, saved={saved_global_step}. Using path value.")
 
         # 2. Load dataloader state if available
-        if dataloader_state_path.exists():
+        if io.exists(dataloader_state_path):
             try:
-                dataloader_state = torch.load(dataloader_state_path, map_location="cpu", weights_only=False)
+                with io.open_file(dataloader_state_path, "rb") as f:
+                    dataloader_state = torch.load(f, map_location="cpu", weights_only=False)
                 self.train_dataloader.load_state_dict(dataloader_state)
                 logger.info("Successfully loaded dataloader state")
             except Exception as e:
@@ -1340,7 +1152,7 @@ class RayPPOTrainer:
         _ = ray.get(
             self.policy_model.async_run_ray_method(
                 "pass_through",
-                "load_ckpt",
+                "load_checkpoint",
                 ckpt_dir=policy_ckpt_dir,
                 load_optimizer_states=True,
                 load_lr_scheduler_states=True,
@@ -1354,7 +1166,7 @@ class RayPPOTrainer:
             _ = ray.get(
                 self.critic_model.async_run_ray_method(
                     "pass_through",
-                    "load_ckpt",
+                    "load_checkpoint",
                     ckpt_dir=critic_ckpt_dir,
                     load_optimizer_states=True,
                     load_lr_scheduler_states=True,

@@ -7,12 +7,13 @@ Data Configuration
 .. code-block:: yaml
 
     data:
-    train_data: ["${oc.env:HOME}/data/gsm8k/train.parquet"]
-    val_data: ["${oc.env:HOME}/data/gsm8k/validation.parquet"]
+      train_data: ["${oc.env:HOME}/data/gsm8k/train.parquet"]
+      val_data: ["${oc.env:HOME}/data/gsm8k/validation.parquet"]
 
-- ``data.train_data``: A list of files for the training dataset in parquet format.
-- ``data.val_data``: A list of files for evaluation in parquet format.
+- ``data.train_data``: A list of files for the training dataset. 
+- ``data.val_data``: A list of files for the evaluation dataset.
 
+A dataset file can be a path to a parquet or json file, or the name of a Hugging Face dataset.
 
 .. note::
     Currently, all datasets are loaded into memory, so the dataset size is limited by available CPU memory on a worker node.
@@ -99,7 +100,7 @@ Checkpoint Configuration
 
     resume_mode: latest # null/"none", "latest", "from_path"
     resume_path: null
-    ckpt_path: "${oc.env:HOME}/ckpts/" # Path for resumable training checkpoints (model state, optimizer state, etc.)
+    ckpt_path: "${oc.env:HOME}/ckpts/" # Local directory path or cloud storage path (S3, GCP) for resumable training checkpoints (model state, optimizer state, etc.)
     max_ckpts_to_keep: -1 # -1 to keep all checkpoints, N to keep the last N checkpoints
     ckpt_interval: 10  # Save full training checkpoint every `ckpt_interval` steps.
     hf_save_interval: -1  # Save HF format model(s)every `hf_save_interval` steps.
@@ -130,7 +131,7 @@ Logging and Debugging Configuration
 Training Backends
 -----------------
 
-We support three backends: FSDP1, FSDP2 and DeepSpeed. The backend can be chosen with ``trainer.strategy`` field.
+We support four backends: FSDP1, FSDP2, Megatron, and DeepSpeed. The backend can be chosen with ``trainer.strategy`` field.
 
 .. _fsdp-configurations:
 
@@ -156,6 +157,47 @@ We use the same configuration group for FSDP1 and FSDP2
     In FSDP, ``cpu_offload`` will offload parameter and optimizer state to CPU memory and only copy over model parameters to GPU during model forward pass.
 
     In `skyrl-train`, we offload worker state in certain colocation settings - however this happens only after the training step/ log probability computation - thus optimizer step and model forward pass happen as usual with sharded parameters on GPU. For more details, refer to the guide on :doc:`model placement and colocation <placement>`
+
+.. _megatron-configurations:
+
+Megatron Configuration
+~~~~~~~~~~~~~~~~~~~~~~
+
+.. code-block:: yaml
+
+    megatron_config:
+      tensor_model_parallel_size: 1 
+      pipeline_model_parallel_size: 1
+      context_parallel_size: 1
+      expert_model_parallel_size: 1
+      expert_tensor_parallel_size: null
+
+      ddp_config: # pass-through config to Megatron's `DistributedDataParallelConfig` object
+        # https://github.com/NVIDIA/Megatron-LM/blob/core_r0.13.0/megatron/core/distributed/distributed_data_parallel_config.py#L8
+        ...
+      optimizer_config_kwargs: # pass-through kwargs to Megatron's `OptimizerConfig` object
+        # any overlapping arguments with those we attempt to resolve in trainer.policy.optimizer_config will be overridden by the values here
+        # https://github.com/NVIDIA/Megatron-LM/blob/core_r0.13.0/megatron/core/optimizer/optimizer_config.py#L12
+        ...
+      model_config_kwargs: # pass-through kwargs to the HuggingFace model config (i.e. for overriding vocab size, etc)
+        ...
+      transformer_config_kwargs: # pass-through kwargs to the Megatron's `TransformerConfig` object
+        # https://github.com/NVIDIA/Megatron-LM/blob/core_r0.13.0/megatron/core/transformer/transformer_config.py#L33
+        ...
+
+
+- ``megatron_config.tensor_model_parallel_size``: Tensor model parallel size for reducing memory across model parameters and activations. Sequence parallelism (unrelated to ulysses sequence parallelism) is also enabled by default if tensor parallel size is greater than 1.
+- ``megatron_config.pipeline_model_parallel_size``: Pipeline model parallel size for sharding model layers across multiple GPUs.
+- ``megatron_config.context_parallel_size``: Context parallel size for reducing activation memory across the sequence length dimension.
+- ``megatron_config.expert_model_parallel_size``: The expert parallel size for sharding expert modules across multiple GPUs.
+- ``megatron_config.expert_tensor_parallel_size``: The tensor parallel size for each expert module. If set to ``null``, then the value will be resolved to ``tensor_model_parallel_size`` by Megatron. It is recommended to set this to ``1`` when enabling ``expert_model_parallel_size > 1`` for the best performance.
+
+Some rules for configuring these parameters:
+
+- ``model_size = pp_size * tp_size * cp_size``
+- ``dp_size = world_size / model_size``
+- ``world_size % (pp_size * ep_size * etp_size) == 0``
+    - This means that ``ep_size * etp_size`` can scale independently of ``tp_size * cp_size``, and can go across data parallel ranks.
 
 .. _deepspeed-configurations:
 
@@ -189,7 +231,7 @@ For both the critic and policy model, we provide a common optimizer configuratio
 - ``optimizer_config.max_grad_norm``: Gradient clipping parameter. The total L2 norm of the model gradients will be scaled to this value during training.
 - ``optimizer_config.offload_after_step``: Whether to offload optimizer state to CPU after step if colocated. When generation and training workers are colocated, we recommend using the default setting of ``true``. In some cases with non-colocation, it can be desirable to leave optimizer state on GPU memory to avoid offloading costs as well as additional CPU memory usage.
 - ``optimizer_config.num_warmup_steps``: Number of warmup steps for the learning rate scheduler.
-- ``optimizer_config.scheduler``: Which learning rate scheduler to use. Intended to align with ``transformers.SchedulerType`` from ([Hugging Face Docs](https://huggingface.co/docs/transformers/main/en/main_classes/optimizer_schedules#transformers.SchedulerType)).
+- ``optimizer_config.scheduler``: Which learning rate scheduler to use. Intended to align with ``transformers.SchedulerType`` from `Huggingface <https://huggingface.co/docs/transformers/main/en/main_classes/optimizer_schedules#transformers.SchedulerType>`_.
 
 Policy Configuration
 --------------------
@@ -262,7 +304,7 @@ Reference Model Configuration
     ref:
       deepspeed_config: ${deepspeed_config.eval}
       fsdp_config:
-        cpu_offload: true
+        cpu_offload: false
         reshard_after_forward: true
         fsdp_size: -1
       sequence_parallel_size: 1
@@ -301,7 +343,7 @@ Algorithm Configuration
       # this adds training batch level normalization to advantages
       advantage_batch_normalize: false
       value_head_prefix: "value_head"
-      policy_loss_type: "regular" # "regular", "dual_clip", "gspo", or customizable with PolicyLossRegistry
+      policy_loss_type: "regular" # "regular", "dual_clip", "gspo", "clip_cov", "kl_cov" or customizable with PolicyLossRegistry
       loss_reduction: "token_mean" # "token_mean", "sequence_mean", "seq_mean_token_sum_norm"
       grpo_norm_by_std: true # set to false to disable normalization by std in GRPO (used in Dr. GRPO)
 
@@ -315,9 +357,19 @@ Algorithm Configuration
       # dual clip parameters
       clip_ratio_c: 3.0
 
+      # clip-cov parameters (only used when policy_loss_type: "clip_cov")
+      clip_cov:
+        clip_ratio: 0.0002 # fraction of tokens to clip based on covariance
+        clip_cov_lb: 1.0 # lower bound for covariance clipping
+        clip_cov_ub: 5.0 # upper bound for covariance clipping
+      
+      # kl-cov parameters (only used when policy_loss_type: "kl_cov")
+      kl_cov:
+        kl_cov_frac: 0.2 # percentage of tokens to apply KL regularization to (20%)
+        ppo_kl_coef: 1.0 # coefficient for KL regularization term
+
       # value loss parameters
       value_clip: 0.2
-      normalize_reward: true
 
       # dynamic sampling parameters
       dynamic_sampling:
@@ -328,7 +380,6 @@ Algorithm Configuration
       # Truncated Importance Sampling as proposed in https://fengyao.notion.site/off-policy-rl 
       use_tis: false 
       tis_imp_ratio_cap: -1.0
-
 
 - ``algorithm.advantage_estimator``: Advantage estimator to use. We currently implement ``grpo``, ``gae``, ``rloo``, ``reinforce++``, and custom advantage estimators can be registered with the ``AdvantageEstimatorRegistry``.
 - ``algorithm.kl_ctrl`` Configuration for the KL controller - only used if ``use_kl_in_reward`` is ``true`` (not applied in the case of ``use_kl_loss`` is ``true``). ``kl_loss_coef`` is used as the initial KL coefficient for both ``fixed`` and ``adaptive`` KL controllers.
@@ -350,6 +401,8 @@ Algorithm Configuration
   - ``regular``: Vanilla PPO loss with token-level importance sampling
   - ``dual_clip``: Dual clip PPO loss proposed in `this paper <https://arxiv.org/pdf/1912.09729>`_
   - ``gspo``: `Group Sequence Policy Optimization <https://arxiv.org/abs/2507.18071>`_ with sequence-level importance sampling for improved training stability. Implements "GSPO-token" variant from the paper.
+  - ``clip_cov``: Clip-Cov combines standard PPO clipping with covariance-based correction masking for improved stability. Based on `this paper <https://arxiv.org/abs/2505.22617>`_.
+  - ``kl_cov``: KL-Cov applies KL regularization to tokens selected based on covariance values. Based on `this paper <https://arxiv.org/abs/2505.22617>`_.
   - Custom policy losses can be registered with the ``PolicyLossRegistry``
 
 - ``algorithm.loss_reduction``: Type of loss reduction to use. Options include:
@@ -365,14 +418,22 @@ Algorithm Configuration
 - ``algorithm.eps_clip_high``: Upper bound for PPO clipping.
 - ``algorithm.clip_ratio_c``: Clip ratio for dual clip PPO loss.
 - ``algorithm.value_clip``: Clip value for value loss.
-- ``algorithm.normalize_reward``: Whether to normalize critic model output (i.e., values). When ``true``, the critic model learns the mean and standard deviation of the values during training and normalizes the values during forward pass.
 - ``algorithm.dynamic_sampling``: Dynamic sampling configuration.
   - ``algorithm.dynamic_sampling.type``: Type of dynamic sampling to use. Currently, we support ``filter`` (`DAPO <https://dapo-sia.github.io/>`_), ``replace`` (`POLARIS <https://hkunlp.github.io/blog/2025/Polaris/>`_ / `WebSailor <https://arxiv.org/abs/2507.02592>`_), or ``null`` for no dynamic sampling.
   - ``algorithm.dynamic_sampling.max_sample_batches``: Maximum number of batches to sample before stopping. Set to ``-1`` to sample forever.
   - ``algorithm.dynamic_sampling.min_replace_ratio``: Minimum proportion of good samples with which to replace bad samples for ``replace`` strategy.
 - ``algorithm.use_tis``: Whether to use Truncated Importance Sampling (TIS) as proposed in `this blog <https://fengyao.notion.site/off-policy-rl>`_. 
 - ``algorithm.tis_imp_ratio_cap``: Cap parameter for the importance ratio in TIS.
+- ``algorithm.clip_cov``: Clip-Cov parameters (only used when ``policy_loss_type`` is ``clip_cov``):
 
+  - ``clip_ratio``: Fraction of tokens to clip based on covariance values.
+  - ``clip_cov_lb``: Lower bound for covariance clipping.
+  - ``clip_cov_ub``: Upper bound for covariance clipping.
+
+- ``algorithm.kl_cov``: KL-Cov parameters (only used when ``policy_loss_type`` is ``kl_cov``):
+
+  - ``kl_cov_frac``: Percentage of tokens to apply KL regularization to.
+  - ``ppo_kl_coef``: Coefficient for KL regularization term.
 
 Policy Loss Formulation
 ~~~~~~~~~~~~~~~~~~~~~~~
@@ -415,6 +476,8 @@ Generator Configuration
     backend: "vllm"
     weight_sync_backend: "nccl"
     inference_engine_tensor_parallel_size: 4
+    inference_engine_expert_parallel_size: 1  
+    inference_engine_data_parallel_size: 1
     n_samples_per_prompt: 5
     async_engine: true
     batched: true
@@ -427,6 +490,7 @@ Generator Configuration
     max_num_seqs: 1024
     remote_inference_engine_urls: ["127.0.0.1:8001"]
     max_turns: 1
+    engine_init_kwargs: {}
 
     override_existing_update_group: "auto" # "auto", "enable", "disable"
     # sampling params for generation phase
@@ -480,6 +544,8 @@ Inference Engine Configuration
 - ``generator.model_dtype``: Dtype used for the inference engine. This is also used during weight transfer - the policy model weights are casted to this dtype before being sent to the inference engine during weight transfer.
 - ``generator.async_engine``:  Whether to use an asynchronous/ offline inference engine. Applicable only when ``backend="vllm"``.
 - ``generator.inference_engine_tensor_parallel_size``: Tensor parallel size for the inference engine.
+- ``generator.inference_engine_expert_parallel_size``: Expert parallel size for the inference engine. Currently, EP is only supported for vLLM backend and ep_size must equal dp_size * tp_size.
+- ``generator.inference_engine_data_parallel_size``: Data parallel size for the inference engine. NOTE: dp_size>1 is not yet supported: https://github.com/NovaSky-AI/SkyRL/issues/202
 - ``generator.gpu_memory_utilization``: GPU memory utilization for the inference engine. Applicable only for ``run_engines_locally=true``.
 - ``generator.vllm_v1_disable_multiproc``: If ``true``, this will set ``VLLM_ENABLE_V1_MULTIPROCESSING=0`` in the environment, which makes the scheduling deterministic. This is useful for reproducibility.
 - ``generator.enable_prefix_caching``: Whether to enable prefix caching for the inference engine. Applicable only when ``backend="vllm"``. This can be left to the default ``true`` in most cases. Note that in the case of remote inference engines, you would need to match the setting used when you initialized the remote servers.
@@ -505,6 +571,7 @@ Generation Parameters
 - ``generator.eval_n_samples_per_prompt``: Number of samples to generate per prompt for evaluation.
 - ``generator.max_turns``: Maximum number of turns for generation with multi-turn RL.
 - ``generator.use_conversation_multi_turn``: Whether to use conversation format for multi-turn generation. If set to ``true`` then observations are appended to the chat history as a new turn. If set to ``false`` then observations are appended as-is to the assistant response in token space and generation is continued  (after removing any EOS token in the response).  We've observed some cases where model can be sensitive to chat history format (ex: in SkyRL-SQL), and thus ``false`` can be used for full control over the exact tokens added after environment interaction.
+- ``generator.engine_init_kwargs``: Inference engine arguments passed directly to the vLLM or SGLang engine. To specify an engine arg in the CLI override, use the format: +generator.engine_init_kwargs.[arg_name]=value. If duplicate kwargs are passed or kwargs clash with existing generator arguments (e.g., ``tensor_parallel_size``), an error is raised.
 
 Misc Configuration
 ~~~~~~~~~~~~~~~~~~

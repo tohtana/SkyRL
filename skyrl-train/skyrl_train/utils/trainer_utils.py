@@ -4,16 +4,19 @@ import ray
 from skyrl_train.workers.worker import PPORayActorGroup
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 import os
-import shutil
 from loguru import logger
-import glob
+from omegaconf import DictConfig
 import json
+import torch
 import numpy as np
 from collections import defaultdict
 from skyrl_train.generators.utils import get_metrics_from_generator_output, concatenate_generator_outputs
 from skyrl_train.generators.base import GeneratorInput, GeneratorOutput
 from transformers import AutoTokenizer
 from pathlib import Path
+from skyrl_train.utils import io
+from skyrl_train.dataset import PromptDataset
+from torchdata.stateful_dataloader import StatefulDataLoader
 
 BasicType = Union[int, float, str, bool, type(None)]
 
@@ -88,36 +91,96 @@ def extract_step_from_path(path: str) -> int:
     return -1
 
 
-def cleanup_old_checkpoints(ckpt_path: str, max_ckpts_to_keep: int, current_global_step: int):
-    """Remove old global_step directories, keeping only the most recent max_ckpts_to_keep"""
+def get_latest_checkpoint_step(checkpoint_base_path: str) -> int:
+    """
+    Get the latest global step from checkpoint directory by reading latest_ckpt_global_step.txt.
 
-    if max_ckpts_to_keep < 0:
+    Args:
+        checkpoint_base_path: Base path where checkpoints are stored
+
+    Returns:
+        int: Latest global step, or 0 if no checkpoint found
+    """
+    latest_file_path = os.path.join(checkpoint_base_path, "latest_ckpt_global_step.txt")
+
+    if not io.exists(latest_file_path):
+        return 0
+
+    try:
+        with io.open_file(latest_file_path, "r") as f:
+            content = f.read().strip()
+        return int(content)
+    except (ValueError, IOError) as e:
+        logger.warning(f"Failed to read latest checkpoint step from {latest_file_path}: {e}")
+        return 0
+
+
+def list_checkpoint_dirs(checkpoint_base_path: str) -> list[str]:
+    """
+    List all checkpoint directories in the base path.
+
+    Args:
+        checkpoint_base_path: Base path where checkpoints are stored
+
+    Returns:
+        list[str]: List of checkpoint directory names
+    """
+    if not io.exists(checkpoint_base_path):
+        return []
+
+    try:
+        all_items = io.list_dir(checkpoint_base_path)
+
+        # Filter for directories that match the global_step_* pattern
+        checkpoint_dirs = []
+        for item in all_items:
+            # Get just the basename for pattern matching
+            basename = os.path.basename(item)
+            if basename.startswith("global_step_") and io.isdir(os.path.join(checkpoint_base_path, basename)):
+                checkpoint_dirs.append(basename)
+
+        return sorted(checkpoint_dirs)
+    except Exception as e:
+        logger.warning(f"Failed to list checkpoint directories from {checkpoint_base_path}: {e}")
+        return []
+
+
+def cleanup_old_checkpoints(checkpoint_base_path: str, max_checkpoints: int) -> None:
+    """
+    Clean up old checkpoints, keeping only the most recent `max_checkpoints` checkpoints.
+
+    Args:
+        checkpoint_base_path: Base path where checkpoints are stored
+        max_checkpoints: Maximum number of checkpoints to keep
+    """
+    if max_checkpoints < 0:
         return
 
-    # Find all global_step directories
-    pattern = os.path.join(ckpt_path, f"{GLOBAL_STEP_PREFIX}*")
-    checkpoint_dirs = glob.glob(pattern)
+    checkpoint_dirs = list_checkpoint_dirs(checkpoint_base_path)
 
-    # track only valid checkpoints - id <= current_global_step
-    checkpoint_dirs = [dir for dir in checkpoint_dirs if extract_step_from_path(dir) <= current_global_step]
-
-    if len(checkpoint_dirs) <= max_ckpts_to_keep:
-        logger.info(f"Only {len(checkpoint_dirs)} checkpoints found for the current run, no need to cleanup")
+    if len(checkpoint_dirs) <= max_checkpoints:
         return
 
-    checkpoint_dirs.sort(key=extract_step_from_path, reverse=True)
-
-    logger.info(
-        f"Found {len(checkpoint_dirs)} checkpoints for the current run, keeping only the most recent {max_ckpts_to_keep}"
-    )
-
-    # Remove old checkpoints
-    for old_dir in checkpoint_dirs[max_ckpts_to_keep:]:
+    # Sort by step number (extract number from global_step_N)
+    def extract_step(dirname):
         try:
-            shutil.rmtree(old_dir)
-            logger.info(f"Removed old checkpoint: {old_dir}")
+            return int(dirname.split("global_step_")[1])
+        except (IndexError, ValueError):
+            return 0
+
+    checkpoint_dirs.sort(key=extract_step)
+
+    # Remove oldest checkpoints
+    dirs_to_remove = checkpoint_dirs[:-max_checkpoints] if max_checkpoints > 0 else checkpoint_dirs
+
+    for dir_name in dirs_to_remove:
+        full_path = os.path.join(checkpoint_base_path, dir_name)
+        try:
+            io.remove(full_path)
+            step_num = extract_step(dir_name)
+            logger.info(f"Cleaned up old checkpoint: global_step_{step_num} at {full_path}")
         except Exception as e:
-            logger.warning(f"Failed to remove old checkpoint {old_dir}: {e}")
+            logger.warning(f"Failed to remove old checkpoint {full_path}: {e}")
 
 
 def validate_consistency_for_latest_checkpoint(
@@ -128,18 +191,19 @@ def validate_consistency_for_latest_checkpoint(
     Asserts that the folder with the highest global step is the latest checkpoint tracked by `latest_checkpoint_file`.
     Otherwise, the folder state is inconsistent and the user should delete other checkpoints.
     """
-    global_step_values = [
-        extract_step_from_path(p) for p in os.listdir(root_ckpt_folder) if p.startswith(GLOBAL_STEP_PREFIX)
-    ]
-    max_global_step_in_folder = max(global_step_values)
-    # NOTE (sumanthrh): We allow a checkpoint folder to be `save_interval` steps ahead of the latest checkpoint in `latest_checkpoint_file`. This is because the last checkpoint can be an incomplete checkpoint.
-    if max_global_step_in_folder - ckpt_iteration > save_interval:
-        max_global_step_in_folder_path = os.path.join(
-            root_ckpt_folder, f"{GLOBAL_STEP_PREFIX}{max_global_step_in_folder}"
-        )
-        raise ValueError(
-            f"Inconsistent checkpoint folder. Latest checkpoint file {latest_checkpoint_file} points to {ckpt_iteration}, but the folder has checkpoints with higher global step - Found global steps {max_global_step_in_folder_path}. This is likely because checkpoint {max_global_step_in_folder_path} was created in a previous run while the latest run is at {checkpoint_path}. Please delete/move checkpoints from older runs and try again."
-        )
+    if io.exists(root_ckpt_folder):
+        checkpoint_dirs = list_checkpoint_dirs(root_ckpt_folder)
+        if checkpoint_dirs:
+            global_step_values = [extract_step_from_path(d) for d in checkpoint_dirs]
+            max_global_step_in_folder = max(global_step_values)
+            # NOTE (sumanthrh): We allow a checkpoint folder to be `save_interval` steps ahead of the latest checkpoint in `latest_checkpoint_file`. This is because the last checkpoint can be an incomplete checkpoint.
+            if max_global_step_in_folder - ckpt_iteration > save_interval:
+                max_global_step_in_folder_path = os.path.join(
+                    root_ckpt_folder, f"{GLOBAL_STEP_PREFIX}{max_global_step_in_folder}"
+                )
+                raise ValueError(
+                    f"Inconsistent checkpoint folder. Latest checkpoint file {latest_checkpoint_file} points to {ckpt_iteration}, but the folder has checkpoints with higher global step - Found global steps {max_global_step_in_folder_path}. This is likely because checkpoint {max_global_step_in_folder_path} was created in a previous run while the latest run is at {checkpoint_path}. Please delete/move checkpoints from older runs and try again."
+                )
 
 
 def sanitize_data_source(data_source: str) -> str:
@@ -230,14 +294,14 @@ def dump_per_dataset_eval_results(
                 }
                 f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
-        print(f"Dumped eval data for {data_source} to {filename}")
+        logger.info(f"Dumped eval data for {data_source} to {filename}")
 
     # Dump aggregated results file
     aggregated_filename = dump_dir_path / "aggregated_results.jsonl"
     with open(aggregated_filename, "w") as f:
         f.write(json.dumps(eval_metrics, ensure_ascii=False) + "\n")
 
-    print(f"Dumped aggregated eval metrics to {aggregated_filename}")
+    logger.info(f"Dumped aggregated eval metrics to {aggregated_filename}")
 
 
 class DynamicSamplingState(TypedDict, total=False):
@@ -562,3 +626,43 @@ def validate_generator_output(input_batch: GeneratorInput, generator_output: Gen
     # loss masks should be non-zero for at least one element for trainer
     if np.concatenate(generator_output["loss_masks"]).sum() == 0:
         logger.warning("All outputs are loss masked, which may lead to NaN loss, please check your generation logic!!")
+
+    # check that the rewards are either List[float-like] or List[List[float-like]]
+    rewards = generator_output["rewards"]
+    if isinstance(rewards[0], list):
+        assert all(
+            isinstance(reward, list) for reward in rewards
+        ), "rewards must be `List[float]` or `List[List[float]]`"
+    else:
+        assert all(
+            not isinstance(reward, list) for reward in rewards
+        ), "rewards must be `List[float]` or `List[List[float]]`"
+
+
+def build_dataloader(cfg: DictConfig, dataset: PromptDataset, is_train=True) -> StatefulDataLoader:
+    """
+    Build the dataloader for the training or evaluation dataset
+    """
+    # prepare dataloader
+    batch_size = cfg.trainer.train_batch_size if is_train else cfg.trainer.eval_batch_size
+
+    # Seed the dataloader for reproducibility.
+    seeded_generator = torch.Generator()
+    seeded_generator.manual_seed(cfg.trainer.seed)
+
+    dataloader = StatefulDataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=True if is_train else False,
+        collate_fn=dataset.collate_fn,
+        # TODO(Charlie): debug why inference http endpoint is slow when num_workers is 8
+        num_workers=0 if cfg.generator.enable_http_endpoint else 8,
+        drop_last=True if is_train else False,
+        generator=seeded_generator,
+    )
+    if is_train:
+        logger.info(f"Total steps: {len(dataloader) * cfg.trainer.epochs}")
+    else:
+        logger.info(f"Validation set size: {len(dataloader)}")
+
+    return dataloader

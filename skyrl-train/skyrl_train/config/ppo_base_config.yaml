@@ -2,6 +2,9 @@ defaults:
   - _self_
   - deepspeed_config@deepspeed_config.train: train
   - deepspeed_config@deepspeed_config.eval: eval
+  # <folder_name>@<field_name>.<field_name>: <yaml_file_name>
+  - megatron_config@trainer.policy.megatron_config: policy
+  - megatron_config@trainer.ref.megatron_config: ref
   - skyrl_gym_config: default
 
 data:
@@ -12,15 +15,12 @@ trainer:
   placement:
     colocate_all: true
     colocate_policy_ref: true
-    colocate_critic_reward: false
     policy_num_nodes: 1
     policy_num_gpus_per_node: 4
     critic_num_nodes: 1
     critic_num_gpus_per_node: 4
     ref_num_nodes: 1
     ref_num_gpus_per_node: 4
-    reward_num_nodes: 1
-    reward_num_gpus_per_node: 4
   sequence_parallel_backend: "ulysses"
   strategy: fsdp2
   policy:
@@ -34,7 +34,7 @@ trainer:
       max_grad_norm: 1.0 # gradient clipping
       offload_after_step: true # offload optimizer state to cpu after each step. Applicable only when `colocate_all=true`
       num_warmup_steps: 0
-      scheduler: "constant_with_warmup"
+      scheduler: "constant_with_warmup"   
     fsdp_config:
       cpu_offload: false # offload params + optimizer state to cpu during fwd pass
       reshard_after_forward: true # fsdp2 only, [True, False, int between 1 and fsdp_size]
@@ -48,7 +48,7 @@ trainer:
     sequence_parallel_size: 1
     deepspeed_config: ${deepspeed_config.eval}
     fsdp_config:
-      cpu_offload: true
+      cpu_offload: false
       reshard_after_forward: true
       fsdp_size: -1
   critic:
@@ -68,15 +68,6 @@ trainer:
       reshard_after_forward: true
       fsdp_size: -1
     sequence_parallel_size: 1
-  reward:
-    model:
-      path: null
-    deepspeed_config: ${deepspeed_config.eval}
-    fsdp_config:
-      cpu_offload: true
-      reshard_after_forward: true
-      fsdp_size: -1
-    sequence_parallel_size: 1
   algorithm:
     advantage_estimator: "grpo"  # "grpo", "gae", "rloo", "reinforce++", or customizable with AdvantageEstimatorRegistry
     kl_ctrl: # only used if use_kl_in_reward is true (not applied in the case of use_kl_loss=true) - uses kl_loss_coef as the initial KL coefficient
@@ -93,7 +84,7 @@ trainer:
     # this adds training batch level normalization to advantages
     advantage_batch_normalize: false
     value_head_prefix: "value_head"
-    policy_loss_type: "regular" # "regular", "dual_clip", "gspo", or customizable with PolicyLossRegistry
+    policy_loss_type: "regular" # "regular", "dual_clip", "gspo", "clip_cov", "kl_cov", or customizable with PolicyLossRegistry
     loss_reduction: "token_mean" # "token_mean", "sequence_mean", "seq_mean_token_sum_norm"
     grpo_norm_by_std: true # set to false to disable normalization by std in GRPO
     # GAE parameters
@@ -107,15 +98,23 @@ trainer:
     # Truncated Importance Sampling as proposed in https://fengyao.notion.site/off-policy-rl 
     tis_imp_ratio_cap: -1.0
     use_tis: false
-
+    
     # value loss parameters
     value_clip: 0.2
-    normalize_reward: true
     dynamic_sampling:
       type: null # filter, replace, or null
       max_sample_batches: 30 # sample at most this many batches before stopping, -1 to sample forever
       min_replace_ratio: 0.3 # minimum proportion of good samples with which to replace bad samples (for replace strategy only)
     
+    # clip-cov parameters (only used when policy_loss_type: "clip_cov"
+    clip_cov:
+      clip_ratio: 0.0002 # fraction of tokens to clip based on covariance
+      clip_cov_lb: 1.0 # lower bound for covariance clipping
+      clip_cov_ub: 5.0 # upper bound for covariance clipping
+    
+    kl_cov:
+      kl_cov_frac: 0.2 # percentage of tokens to apply KL regularization to (20%)
+      ppo_kl_coef: 1.0
 
   gradient_checkpointing: true
   gradient_checkpointing_use_reentrant: false
@@ -145,7 +144,6 @@ trainer:
   flash_attn: true
   disable_fast_tokenizer: false
   target_modules: "all-linear"
-  use_orm_score: false
   project_name: "skyrl"
   run_name: "test_run"
   logger: "wandb"
@@ -154,6 +152,7 @@ trainer:
 
 
 generator:
+  model_name: ${trainer.policy.model.path}
   model_dtype: "bfloat16" # should match dtype for inference engine
   run_engines_locally: true
   num_inference_engines: 1
@@ -162,6 +161,8 @@ generator:
   # if using cuda_ipc, we send in batches of this size in GB
   weight_transfer_threshold_cuda_ipc_GB: 1.0
   inference_engine_tensor_parallel_size: 4
+  inference_engine_expert_parallel_size: 1
+  inference_engine_data_parallel_size: 1  # NOTE: dp_size>1 is not yet supported: https://github.com/NovaSky-AI/SkyRL/issues/202
   n_samples_per_prompt: 5
   async_engine: true
   batched: false
@@ -180,10 +181,15 @@ generator:
   http_endpoint_port: 8000
   max_turns: 1
 
+  # Inference engine arguments. Arguments are passed directly to the vLLM or SGLang engine, so names must match
+  # the engine's args. To specify an engine arg in the CLI override, use the format: +generator.engine_init_kwargs.arg_name=value
+  engine_init_kwargs: {}
+
   override_existing_update_group: "auto" # "auto", "enable", "disable"
   # sampling params for generation phase
   sampling_params:
     max_generate_length: 1024
+    repetition_penalty: 1.0
     temperature: 1.0
     top_p: 1.0
     min_p: 0.0
@@ -204,6 +210,7 @@ generator:
   # sampling params for evaluation
   eval_sampling_params:
     max_generate_length: ${generator.sampling_params.max_generate_length}
+    repetition_penalty: 1.0
     temperature: 0.0
     top_p: 1.0
     min_p: 0.0

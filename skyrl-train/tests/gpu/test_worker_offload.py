@@ -9,8 +9,8 @@ from omegaconf import DictConfig
 import os
 import shutil
 
-from tests.gpu.utils import init_worker_with_type, make_dummy_experience, make_dummy_tensorbatch
-from skyrl_train.utils.utils import print_mem, validate_cfg
+from tests.gpu.utils import init_worker_with_type, make_dummy_experience, make_dummy_tensorbatch, get_rank_0_memory
+from skyrl_train.utils.utils import validate_cfg
 from skyrl_train.entrypoints.main_base import config_dir
 from skyrl_train.training_batch import TrainingOutputBatch
 
@@ -34,12 +34,6 @@ def get_test_actor_config() -> DictConfig:
 @pytest.fixture
 def cfg() -> DictConfig:
     return get_test_actor_config()
-
-
-def get_rank_0_memory(actor_group, message: str):
-    mem = ray.get(actor_group.async_run_ray_method("pass_through", "get_cuda_memory"))[0]
-    print_mem(message, mem)
-    return mem["allocated"]
 
 
 @pytest.mark.asyncio
@@ -344,7 +338,7 @@ def test_offload_after_ckpt(strategy):
         checkpoint_dir = os.path.expandvars(os.path.join(cfg.trainer.ckpt_path, "global_step_1"))  # Store for cleanup
 
         # Step 2: Save checkpoint
-        ray.get(actor_group.async_run_ray_method("pass_through", "save_ckpt", global_step=1, ckpt_dir=checkpoint_path))
+        ray.get(actor_group.async_run_ray_method("pass_through", "save_checkpoint", ckpt_dir=checkpoint_path))
         after_training = get_rank_0_memory(actor_group, "After ckpt")
 
         # Step 3:Offload model to CPU

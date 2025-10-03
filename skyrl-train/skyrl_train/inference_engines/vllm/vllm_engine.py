@@ -1,12 +1,25 @@
 import os
 from typing import List, Any, Dict, Optional
 from dataclasses import dataclass
+from http import HTTPStatus
 import ray
 import torch
 import asyncio
 import vllm
+from types import SimpleNamespace
 from vllm import SamplingParams
 from vllm.inputs import TokensPrompt
+from vllm.entrypoints.openai.serving_chat import OpenAIServingChat
+from vllm.entrypoints.openai.serving_completion import OpenAIServingCompletion
+from vllm.entrypoints.openai.serving_models import BaseModelPath, OpenAIServingModels
+from vllm.entrypoints.openai.protocol import (
+    ChatCompletionRequest,
+    ChatCompletionResponse,
+    ErrorResponse,
+    ErrorInfo,
+    CompletionRequest,
+    CompletionResponse,
+)
 from torch.distributed import destroy_process_group
 from skyrl_train.distributed.utils import init_custom_process_group
 from uuid import uuid4
@@ -17,6 +30,8 @@ from skyrl_train.inference_engines.base import (
     InferenceEngineOutput,
     NamedWeightsUpdateRequest,
 )
+from skyrl_train.inference_engines.vllm.utils import pop_openai_kwargs
+from loguru import logger
 from skyrl_train.utils import str_to_torch_dtype
 
 
@@ -46,7 +61,7 @@ def setup_envvars_for_vllm(kwargs, bundle_indices):
     if bundle_indices is not None:
         os.environ["VLLM_RAY_PER_WORKER_GPUS"] = str(num_gpus)
         os.environ["VLLM_RAY_BUNDLE_INDICES"] = ",".join(map(str, bundle_indices))
-        print(f"creating LLM with bundle_indices={bundle_indices}")
+        logger.info(f"creating LLM with bundle_indices={bundle_indices}")
 
 
 class WorkerWrap:
@@ -70,7 +85,7 @@ class WorkerWrap:
 
         if getattr(self, "_model_update_group", None):
             if override_existing:
-                print("Destroying existing model update group")
+                logger.info("Destroying existing model update group")
                 destroy_process_group(self._model_update_group)
                 self._model_update_group = None
             else:
@@ -79,7 +94,7 @@ class WorkerWrap:
                 )
 
         rank = torch.distributed.get_rank() + rank_offset
-        print(
+        logger.info(
             f"torch.distributed.get_rank(): {torch.distributed.get_rank()}, rank_offset: {rank_offset}, rank: {rank}, world_size: {world_size}, group_name: {group_name}"
         )
 
@@ -90,7 +105,7 @@ class WorkerWrap:
             rank=rank,
             group_name=group_name,
         )
-        print(
+        logger.info(
             f"init_weight_update_communicator: master_address={master_address}, master_port={master_port}, ",
             f"rank={rank}, world_size={world_size}, group_name={group_name}",
         )
@@ -159,13 +174,16 @@ class BaseVLLMInferenceEngine(InferenceEngineInterface):
 
         # Store common attributes
         self._tp_size = kwargs.get("tensor_parallel_size", 1)
+        self._dp_size = kwargs.get("data_parallel_size", 1)
 
         # Let subclass create the appropriate engine
         self.llm = self._create_engine(*args, **kwargs)
 
     def tp_size(self):
-        """Return the tensor parallel size."""
         return self._tp_size
+
+    def dp_size(self):
+        return self._dp_size
 
     def _create_engine(self, *args, **kwargs):
         """Abstract method for subclasses to implement engine creation."""
@@ -250,11 +268,19 @@ class VLLMInferenceEngine(BaseVLLMInferenceEngine):
 
         return self._postprocess_outputs(outputs)
 
+    async def chat_completion(self, request_payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Only supported in AsyncVLLMInferenceEngine."""
+        raise NotImplementedError()
+
+    async def completion(self, request_payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Only supported in AsyncVLLMInferenceEngine."""
+        raise NotImplementedError()
+
     async def wake_up(self, *args: Any, **kwargs: Any):
         await asyncio.to_thread(self.llm.wake_up, tags=kwargs.get("tags", None))
 
     async def sleep(self, *args: Any, **kwargs: Any):
-        await asyncio.to_thread(self.llm.sleep, level=kwargs.get("level", 1))
+        await asyncio.to_thread(self.llm.sleep, level=kwargs.get("level", 2))
 
     async def init_weight_update_communicator(
         self, master_addr, master_port, rank_offset, world_size, group_name, backend, override_existing: bool = False
@@ -309,9 +335,41 @@ class AsyncVLLMInferenceEngine(BaseVLLMInferenceEngine):
     """Asynchronous VLLM engine."""
 
     def _create_engine(self, *args, **kwargs):
+        openai_kwargs = pop_openai_kwargs(kwargs)
         # TODO (erictang000): potentially enable log requests for a debugging mode
         engine_args = vllm.AsyncEngineArgs(enable_log_requests=False, **kwargs)
-        return vllm.AsyncLLMEngine.from_engine_args(engine_args)
+        engine = vllm.AsyncLLMEngine.from_engine_args(engine_args)
+
+        # Adapted from https://github.com/volcengine/verl/blob/e90f18c40aa639cd25092b78a5ff7e2d2508c088/verl/workers/rollout/vllm_rollout/vllm_async_server.py#L327
+        model_config = engine.model_config
+        model_path = kwargs.get("model")
+        # TODO(Charlie): add a config similar to vllm's `served_model_name`. See https://github.com/NovaSky-AI/SkyRL/pull/238#discussion_r2326561295
+        model_name = model_path
+
+        base_model_paths = [BaseModelPath(name=model_name, model_path=model_path)]
+        models = OpenAIServingModels(engine, model_config, base_model_paths)
+        # TODO(Charlie): revisit kwargs `enable_auto_tools` and `tool_parser` when we need to
+        # support OAI-style tool calling; and `request_logger` for better debugging.
+        self.openai_serving_chat = OpenAIServingChat(
+            engine_client=engine,
+            model_config=model_config,
+            models=models,
+            response_role="assistant",
+            request_logger=None,
+            chat_template=None,
+            chat_template_content_format="auto",
+            **openai_kwargs,
+        )
+
+        # TODO(Charlie): revisit kwargs `return_tokens_as_token_ids`,
+        # `enable_prompt_tokens_details`, `enable_force_include_usage`.
+        self.openai_serving_completion = OpenAIServingCompletion(
+            engine_client=engine,
+            model_config=model_config,
+            models=models,
+            request_logger=None,
+        )
+        return engine
 
     async def _collect_outputs(self, prompt_token_ids, request_id: str, sampling_params: SamplingParams):
         """Collect outputs for a single prompt."""
@@ -347,7 +405,7 @@ class AsyncVLLMInferenceEngine(BaseVLLMInferenceEngine):
         # TODO(team): remove once vllm fixes this
         # otherwise waking it up will output gibberish: https://github.com/vllm-project/vllm/issues/17103
         await self.reset_prefix_cache()
-        await self.llm.sleep(level=kwargs.get("level", 1))
+        await self.llm.sleep(level=kwargs.get("level", 2))
 
     async def init_weight_update_communicator(
         self, master_addr, master_port, rank_offset, world_size, group_name, backend, override_existing: bool = False
@@ -403,6 +461,91 @@ class AsyncVLLMInferenceEngine(BaseVLLMInferenceEngine):
     async def _destroy_weights_update_group(self):
         engine = self._get_engine()
         return await engine.collective_rpc("destroy_weights_update_group")
+
+    # ----------------------------------------
+    # Methods for handling OpenAI API requests
+    # ----------------------------------------
+
+    async def _handle_openai_request(self, request_payload: Dict[str, Any], endpoint: str) -> Dict[str, Any]:
+        """Handle OpenAI API request."""
+        assert endpoint in ["/chat/completions", "/completions"]
+
+        body = request_payload.get("json", {})
+        headers = request_payload.get("headers", {})
+
+        # 1. Build request
+        try:
+            if endpoint == "/chat/completions":
+                request = ChatCompletionRequest(**body)
+            else:
+                request = CompletionRequest(**body)
+            assert request.stream is False, "Streaming is not supported in SkyRL yet, please set stream to False."
+        except Exception as e:
+            return ErrorResponse(
+                error=ErrorInfo(
+                    message=str(e),
+                    type=HTTPStatus.BAD_REQUEST.phrase,
+                    code=HTTPStatus.BAD_REQUEST.value,
+                ),
+            ).model_dump()
+
+        # 2. Call vllm engine
+        try:
+            # Create a minimal request-like object with attributes used by vLLM
+            minimal_request = _MinimalRequest(headers)
+            if endpoint == "/chat/completions":
+                generator = await self.openai_serving_chat.create_chat_completion(request, minimal_request)
+                assert isinstance(generator, (ChatCompletionResponse, ErrorResponse))
+            else:
+                generator = await self.openai_serving_completion.create_completion(request, minimal_request)
+                assert isinstance(generator, (CompletionResponse, ErrorResponse))
+            return generator.model_dump()
+
+        except Exception as e:
+            # Handle it here so we can surface the error from a ray worker.
+            return ErrorResponse(
+                error=ErrorInfo(
+                    message=str(e),
+                    type=HTTPStatus.INTERNAL_SERVER_ERROR.phrase,
+                    code=HTTPStatus.INTERNAL_SERVER_ERROR.value,
+                ),
+            ).model_dump()
+
+    async def chat_completion(self, request_payload: Dict[str, Any]) -> Dict[str, Any]:
+        """OpenAI-compatible HTTP endpoint for handling `/chat/completions` in Python vLLM engine.
+
+        Accepts a JSON-serializable payload: {"json": <request-body>, "headers": <headers-dict>}.
+        Constructs a minimal request-like object for vLLM's openai_serving_chat.
+        Returns a plain dict, either a ChatCompletionResponse or an ErrorResponse, both defined
+        in vllm.entrypoints.openai.protocol.
+        """
+        return await self._handle_openai_request(request_payload, endpoint="/chat/completions")
+
+    async def completion(self, request_payload: Dict[str, Any]) -> Dict[str, Any]:
+        """OpenAI-compatible HTTP endpoint for handling `/completions` in Python vLLM engine.
+
+        Accepts a JSON-serializable payload: {"json": <request-body>, "headers": <headers-dict>}.
+        Constructs a minimal request-like object for vLLM's openai_serving_completion.
+        Returns a plain dict, either a CompletionResponse or an ErrorResponse, both defined
+        in vllm.entrypoints.openai.protocol.
+        """
+        return await self._handle_openai_request(request_payload, endpoint="/completions")
+
+
+class _MinimalRequest:
+    """
+    Minimal request-like object for vLLM's openai_serving_chat and openai_serving_completion.
+
+    We cannot use the original user Request object because it cannot be serialized and hence
+    cannot be a ray method argument. Instead we take the original request's headers and
+    reconstruct an instance of _MinimalRequest to mimic the FastAPI Request object.
+
+    The fields depend on what vLLM accesses internally.
+    """
+
+    def __init__(self, headers):
+        self.headers = headers  # Expect a mapping with .get support
+        self.state = SimpleNamespace()  # vLLM sets raw_request.state.request_metadata
 
 
 VLLMRayActor = ray.remote(VLLMInferenceEngine)
