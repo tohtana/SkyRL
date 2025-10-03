@@ -336,7 +336,7 @@ class DeepspeedStrategy(DistributedStrategy):
 
     def _set_bf16_config(self, ds_config):
         # torch_autocast.enabled should be set in the config file
-        # So we set the ds_config only if torch_autocast.enabled is not set
+        # Set DeepSpeed's bf16 config only if torch_autocast is disabled.
         if not ds_config["torch_autocast"]["enabled"]:
             ds_config["bf16"] = {"enabled": self.bf16}
 
